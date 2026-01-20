@@ -1,0 +1,2471 @@
+
+Preliminary analysis comparing organoid and featal bulk data
+
+Derivation of a bulk conserved co-expression score, using a simple linear model.
+
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(MetaMarkers)
+library(ggridges)
+library(caret)
+```
+
+
+```{r}
+human_gtf =rtracklayer::import('/vault/werner/cross_species_XCI/genomes/Homo_sapiens/gencode.v25.annotation.gtf')
+human_gtf = as.data.frame(human_gtf)
+human_gtf %>% filter(type == 'gene')
+```
+
+
+
+
+BrainSpan is RPKM
+
+
+```{r}
+
+
+brainSpan_bulk_meta = data.table::fread('/inkwell03/werner/bulk_data/brainSpan/columns_metadata.csv')
+brainSpan_bulk_meta$sample_name = paste(brainSpan_bulk_meta$donor_name, brainSpan_bulk_meta$structure_acronym, sep = '_')
+
+brainSpan_bulk_meta
+
+length(unique(brainSpan_bulk_meta$structure_name))
+
+```
+
+
+```{r}
+
+table(brainSpan_bulk_meta$age)
+
+
+age_sample_df = brainSpan_bulk_meta %>% filter(grepl('pcw', age)) %>%  group_by(age) %>% summarise(n = n())
+age_sample_df$age_int = as.integer(sapply(strsplit(age_sample_df$age, split = ' ', fixed = T), '[[', 1 ))
+age_sample_df = age_sample_df %>% arrange(age_int)
+
+age_sample_df$age = factor(age_sample_df$age, levels = age_sample_df$age)
+
+ggplot(age_sample_df, aes(x = age, y = n)) + geom_bar(stat = 'identity') + ggtitle('BrainSpan bulk fetal data') + ylab('Sample #')
+
+
+fetal_pcw_donors = unique(brainSpan_bulk_meta %>% filter(grepl('pcw', age)) %>% pull(donor_name))
+
+
+```
+
+
+```{r}
+
+fetal_gene_meta = data.table::fread('/inkwell03/werner/bulk_data/brainSpan/rows_metadata.csv')
+
+```
+
+
+bulk rna of the fetal brain samples
+
+
+```{r}
+
+all_fetal_bulk_counts = data.table::fread('/inkwell03/werner/bulk_data/brainSpan/expression_matrix.csv')
+all_fetal_bulk_counts[1:10, 1:10]
+
+colnames(all_fetal_bulk_counts) = c('row_num', brainSpan_bulk_meta$sample_name)
+
+all_fetal_bulk_counts = all_fetal_bulk_counts %>% pivot_longer(!row_num, names_to = 'sample', values_to = 'RPKM')
+
+
+gene_index = match(all_fetal_bulk_counts$row_num, fetal_gene_meta$row_num )
+all_fetal_bulk_counts$ensembl = fetal_gene_meta$ensembl_gene_id[gene_index]
+all_fetal_bulk_counts$gene_symbol = fetal_gene_meta$gene_symbol[gene_index]
+
+all_fetal_bulk_counts$donor_name = sapply(strsplit(all_fetal_bulk_counts$sample, '_', fixed = T), '[[', 1)
+
+#Filter for just the actual fetal data
+all_fetal_bulk_counts = all_fetal_bulk_counts %>% filter(donor_name %in% fetal_pcw_donors  )
+
+
+
+
+
+```
+
+
+
+
+
+
+Load up the organoid bulk counts
+
+```{r}
+
+org_bulk_meta = data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/sample_IDs.csv')
+org_bulk_meta 
+
+length(unique(org_bulk_meta$Region))
+
+```
+
+```{r}
+org_bulk_counts = data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/count.matrix.v1.27.txt')
+org_bulk_counts = as.data.frame(org_bulk_counts)
+
+
+rownames(org_bulk_counts) = org_bulk_counts$V1
+org_bulk_counts = org_bulk_counts[ , 2:ncol(org_bulk_counts)]
+
+dim(org_bulk_counts)
+org_bulk_counts[1:10, 1:10]
+
+
+org_genes = rownames(org_bulk_counts)
+
+#Get the metadata associated with the organoid genes
+index = match(org_genes, human_gtf$gene_name)
+org_gene_meta = human_gtf[index, c('gene_name','gene_id','gene_type', 'width') ]
+
+org_gene_meta$width_kilo = org_gene_meta$width/1000
+
+```
+
+RPKM the organoid counts
+
+```{r}
+#First compute CPM
+scale_factors = colSums(org_bulk_counts)
+org_norm_counts = t(t(org_bulk_counts) / scale_factors) * 1e6
+
+
+#Then divide each row by the gene's kilobase, this gives RPKM
+org_norm_counts = org_norm_counts / org_gene_meta$width_kilo
+org_norm_counts = as.tibble(org_norm_counts, rownames = 'gene')
+org_norm_counts[1:10, 1:10]
+
+
+#Pivot longer
+org_norm_counts = org_norm_counts %>% pivot_longer(!gene, names_to = 'sample', values_to = 'RPKM')
+org_norm_counts
+
+```
+
+
+
+
+237 fetal samples
+243 organoid samples
+```{r}
+
+all_fetal_bulk_counts %>% group_by(sample) %>% summarise(n = n())
+
+org_norm_counts %>% group_by(sample) %>% summarise(n = n())
+
+```
+
+
+Get dfs of the average expression of each gene across samples, good to check against later
+```{r}
+
+
+avg_fetal_gene_exp_df = all_fetal_bulk_counts %>% group_by(gene_symbol) %>% summarise(mean_RPKM = mean(RPKM))
+
+avg_org_gene_exp_df = org_norm_counts %>% group_by(gene) %>% summarise(mean_RPKM = mean(RPKM))
+
+
+```
+
+
+Also split the fetal data into a training and a testing set
+
+```{r}
+
+brainSpan_bulk_meta %>% filter(donor_name %in% fetal_pcw_donors) %>% group_by(donor_name, age) %>% summarise(n = n())
+
+#Determining the split by age as much as possible
+fetal_split_1_donors = c('H376.IIA.50','H376.IIB.50','H376.IIB.51','H376.IIIA.51','H376.IIIB.50','H376.IIIB.52','H376.IV.51','H376.IV.50','H376.V.52','H376.V.53')
+fetal_split_2_donors = c('H376.IIA.51','H376.IIB.52','H376.IIIA.50','H376.IIIA.52','H376.IIIB.51','H376.IIIB.53','H376.IV.53','H376.IV.54','H376.V.51','H376.V.50')
+
+
+
+brainSpan_bulk_meta %>% filter(donor_name %in% fetal_split_1_donors ) %>% group_by(age, gender) %>% summarise(n = n())
+
+brainSpan_bulk_meta %>% filter(donor_name %in% fetal_split_2_donors ) %>% group_by(age, gender) %>% summarise(n = n())
+
+
+```
+
+
+
+
+
+Now load up the fetal Metamarkers from our organoid paper
+
+```{r}
+
+fetal_metaMarkers = read_meta_markers('/vault/werner/meta_qc_organoid/data/metamarkers/fetal_meta_markers_v2.csv.gz')
+
+top_markers = fetal_metaMarkers %>% filter(rank <= 100 & cell_type != 'other')
+
+
+dup_genes = top_markers$gene[which(duplicated(top_markers$gene))]
+#For each duplicate, assign it to the cell-type with the better (minimum) rank
+keep_dups = top_markers %>% filter(gene %in% dup_genes) %>% group_by(gene) %>% filter(rank == min(rank))
+top_markers = top_markers %>% filter(!gene %in% dup_genes)
+top_markers = rbind(top_markers, keep_dups)
+top_markers = top_markers %>% arrange(cell_type, rank)
+
+```
+
+
+```{r}
+all_fetal_bulk_counts
+
+
+marker_index = match(all_fetal_bulk_counts$gene_symbol, top_markers$gene )
+
+all_fetal_bulk_counts$fetal_metaMarker = top_markers$cell_type[marker_index]
+
+
+sum_marker_rpkm_df = all_fetal_bulk_counts %>% filter(!is.na(fetal_metaMarker)) %>% group_by(sample, fetal_metaMarker) %>% summarise(sum_rpkm = sum(RPKM))
+
+
+
+
+ggplot(sum_marker_rpkm_df, aes(x = log10(sum_rpkm), y = fetal_metaMarker))  + geom_density_ridges()
+
+
+```
+
+
+```{r}
+org_norm_counts
+
+marker_index = match(org_norm_counts$gene, top_markers$gene)
+org_norm_counts$fetal_metaMarker = top_markers$cell_type[marker_index]
+
+
+table(c(top_markers %>% filter(cell_type == 'Non-neuronal') %>% pull(gene) ) %in% org_norm_counts$gene)
+
+
+sum_org_marker_rpkm_df = org_norm_counts %>% filter(!is.na(fetal_metaMarker)) %>% 
+  group_by(sample, fetal_metaMarker) %>% 
+  summarise(sum_rpkm = sum(RPKM, na.rm = T))
+
+
+ggplot(sum_org_marker_rpkm_df, aes(x = log10(sum_rpkm), y = fetal_metaMarker))  + geom_density_ridges()
+
+
+```
+
+
+```{r}
+
+sum_org_marker_rpkm_df$sample_type = rep('organoid', length = nrow(sum_org_marker_rpkm_df))
+
+sum_marker_rpkm_df$sample_type = rep('fetal', length = nrow(sum_marker_rpkm_df))
+
+
+all_bulk_marker_expression = rbind(sum_org_marker_rpkm_df, sum_marker_rpkm_df)
+temp_fetal = all_bulk_marker_expression %>% group_by(fetal_metaMarker, sample_type) %>% 
+  summarise(median_rpkm = median(sum_rpkm)) %>% filter(sample_type == 'fetal')
+temp_org = all_bulk_marker_expression %>% group_by(fetal_metaMarker, sample_type) %>% 
+  summarise(median_rpkm = median(sum_rpkm)) %>% filter(sample_type == 'organoid')
+
+temp_org$sample_diff = temp_fetal$median_rpkm - temp_org$median_rpkm
+
+sample_order = temp_org %>% arrange(sample_diff) %>% pull(fetal_metaMarker)
+
+all_bulk_marker_expression$fetal_metaMarker = factor(all_bulk_marker_expression$fetal_metaMarker , levels = c(sample_order))
+
+index = match(all_bulk_marker_expression$sample, org_bulk_meta$Sample_ID)
+all_bulk_marker_expression$Region = org_bulk_meta$Region[index]
+
+all_bulk_marker_expression$Region[is.na(all_bulk_marker_expression$Region)] = 'Fetal'
+
+table(all_bulk_marker_expression$Region)
+
+ggplot(all_bulk_marker_expression, aes(x = fetal_metaMarker, y = log10(sum_rpkm), fill = Region)) + geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) + ggtitle('Bulk fetal and organoid data') + 
+  xlab('Top fetal MetaMarkers (single cell)') +
+  ylab('Aggregate expression: log10(Sum(RPKM))')
+
+
+
+```
+
+
+Compare the average exression of 50% of a marker set to the average expression of the other 50%, across samples
+Expectation is that these should be highly correlated
+
+
+```{r}
+
+marker_exp_df = all_fetal_bulk_counts %>% filter(fetal_metaMarker == 'GABAergic')
+
+non_marker_exp_df = all_fetal_bulk_counts %>% filter(is.na(fetal_metaMarker))
+
+
+
+```
+
+
+```{r}
+
+current_markers = unique(marker_exp_df$gene_symbol)
+
+current_nonmarkers = unique(non_marker_exp_df$gene_symbol)
+
+
+#Randomly sample 50% of the genes
+x_half_markers = sample(current_markers, size = length(current_markers)/2)
+y_half_markers = current_markers[!current_markers %in% x_half_markers]
+
+#Get the average rpkm in each sample of the x and y half markers
+avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% x_half_markers], na.rm = T),
+                                                 mean_y = mean(RPKM[gene_symbol %in% y_half_markers], na.rm = T))
+
+
+x_half_nonmarkers = sample(current_nonmarkers, size = 50)
+y_half_nonmarkers = sample(current_nonmarkers[!current_nonmarkers %in% x_half_nonmarkers], size = 50)
+
+#Get the average rpkm in each sample of the x and y half markers
+
+avg_non_marker_exp_df = non_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% x_half_nonmarkers], na.rm = T),
+                                                 mean_y = mean(RPKM[gene_symbol %in% y_half_nonmarkers]), na.rm = T)
+
+
+ggplot(avg_marker_exp_df, aes(x = log10(mean_x), y = log10(mean_y))) + geom_point() +
+  ggtitle('Glutamatergic MetaMarkers') + xlab('Mean RPKM of 50% of markers') + ylab('Mean RPKM of the other 50% of markers')
+
+ggplot(avg_non_marker_exp_df, aes(x = log10(mean_x), y = log10(mean_y)))+ geom_point() +
+  ggtitle('100 randomly sampled non-markers') + xlab('Mean RPKM of 50% of markers') + ylab('Mean RPKM of the other 50% of markers')
+
+
+
+
+
+```
+
+
+First test the x and y averaging split for the strength of the model. Average 50% to predict the remaining 50%, average 40% to predict the remaining 60%, and so on comparing the R2 of the models across samples.
+
+
+```{r}
+
+get_lm_marker_split = function(marker_exp_df, marker_split = .5, to_log = F){
+  
+  
+  current_markers = unique(marker_exp_df$gene_symbol)
+  #Randomly sample the genes, split by marker_split
+  x_split_markers = sample(current_markers, size = length(current_markers)*marker_split)
+  y_split_markers = current_markers[!current_markers %in% x_split_markers]
+  
+  #Get the average rpkm in each sample of the x and y half markers
+  avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% x_split_markers], na.rm = T),
+                                                   mean_y = mean(RPKM[gene_symbol %in% y_split_markers], na.rm = T))
+  
+  if(to_log){
+    lm_sample = lm(log10(mean_y)~log10(mean_x), data = avg_marker_exp_df) 
+  }else{
+    lm_sample = lm(mean_y~mean_x, data = avg_marker_exp_df) 
+  }
+
+  return(lm_sample)
+}
+
+
+
+lm_split_sweep = function(bulk_long_counts, cell_type, num_samples = 100){
+
+
+  marker_exp_df = bulk_long_counts %>% filter(fetal_metaMarker == cell_type)
+  
+  r_sq_log_5_split = sapply(1:num_samples, function(x) { 
+    y = get_lm_marker_split(marker_exp_df, marker_split = .5, to_log = T)
+    return(summary(y)$r.squared)
+  })
+  
+  r_sq_log_4_split = sapply(1:num_samples, function(x) { 
+    y = get_lm_marker_split(marker_exp_df, marker_split = .4, to_log = T)
+    return(summary(y)$r.squared)
+  })
+  
+  r_sq_log_3_split = sapply(1:num_samples, function(x) { 
+    y = get_lm_marker_split(marker_exp_df, marker_split = .3, to_log = T)
+    return(summary(y)$r.squared)
+  })
+  
+  r_sq_log_2_split = sapply(1:num_samples, function(x) { 
+    y = get_lm_marker_split(marker_exp_df, marker_split = .2, to_log = T)
+    return(summary(y)$r.squared)
+  })
+  
+  r_sq_log_1_split = sapply(1:num_samples, function(x) { 
+    y = get_lm_marker_split(marker_exp_df, marker_split = .1, to_log = T)
+    return(summary(y)$r.squared)
+  })
+
+  
+  r_sq_df = data.frame(split_50 = r_sq_log_5_split, split_40 = r_sq_log_4_split, split_30 = r_sq_log_3_split, 
+                       split_20 = r_sq_log_2_split, split_10 = r_sq_log_1_split  )
+  r_sq_df = reshape2::melt(r_sq_df, value.name = 'r.squared')
+  
+  p1 = ggplot(r_sq_df, aes(x = variable, y = r.squared )) + geom_boxplot() + 
+    ylim(0,1) +
+    ggtitle(sprintf('%s MetaMarkers', cell_type))
+
+  return(p1)
+}
+
+table(fetal_metaMarkers$cell_type)
+
+gaba_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'GABAergic')
+print(gaba_sweep)
+
+glut_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Glutamatergic')
+print(glut_sweep)
+
+nonN_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Non-neuronal')
+print(nonN_sweep)
+
+divProg_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Dividing_Progenitor')
+print(divProg_sweep)
+
+intProg_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Intermediate_Progenitor')
+print(intProg_sweep)
+
+nProg_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Neural_Progenitor')
+print(nProg_sweep)
+
+micro_sweep = lm_split_sweep(all_fetal_bulk_counts, cell_type = 'Microglia/Immune')
+print(micro_sweep)
+
+```
+
+
+And now try aggregating models across folds
+Ends up just being an average of the folds' performance, which is expected. But there is still highly variable performance dependent on the fold sampling, suggests there are some genes better than others at predicting the other markers expression
+
+```{r}
+
+marker_exp_df = all_fetal_bulk_counts %>% filter(fetal_metaMarker == 'Glutamatergic')
+current_markers = unique(marker_exp_df$gene_symbol)
+
+#Shuffle the markers
+current_markers = current_markers[sample(1:length(current_markers), size = length(current_markers))]
+
+bin_values = cut_interval(1:length(current_markers), n = 3)
+bins = levels(bin_values)
+
+final_bin_index = bin_values == bins[3]
+
+
+bin_1_index = bin_values == bins[1]
+train_bin = current_markers[bin_1_index]
+predict_bin = current_markers[!bin_1_index & !final_bin_index]
+
+#Get the average rpkm in each sample of the x and y half markers
+avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% train_bin], na.rm = T),
+                                                 mean_y = mean(RPKM[gene_symbol %in% predict_bin], na.rm = T))
+
+lmFold1_log = lm(log10(mean_y)~log10(mean_x), data = avg_marker_exp_df) 
+
+
+
+bin_2_index = bin_values == bins[2]
+train_bin = current_markers[bin_2_index]
+predict_bin = current_markers[!bin_2_index & !final_bin_index]
+
+#Get the average rpkm in each sample of the x and y half markers
+avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% train_bin], na.rm = T),
+                                                 mean_y = mean(RPKM[gene_symbol %in% predict_bin], na.rm = T))
+
+lmFold2_log = lm(log10(mean_y)~log10(mean_x), data = avg_marker_exp_df) 
+
+
+# 
+# bin_3_index = bin_values == bins[3]
+# train_bin = current_markers[bin_3_index]
+# predict_bin = current_markers[!bin_3_index & !final_bin_index]
+# 
+# #Get the average rpkm in each sample of the x and y half markers
+# avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% train_bin], na.rm = T),
+#                                                  mean_y = mean(RPKM[gene_symbol %in% predict_bin], na.rm = T))
+# 
+# lmFold3_log = lm(log10(mean_y)~log10(mean_x), data = avg_marker_exp_df) 
+# 
+# bin_4_index = bin_values == bins[4]
+# train_bin = current_markers[bin_4_index]
+# predict_bin = current_markers[!bin_4_index & !final_bin_index]
+# 
+# #Get the average rpkm in each sample of the x and y half markers
+# avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% train_bin], na.rm = T),
+#                                                  mean_y = mean(RPKM[gene_symbol %in% predict_bin], na.rm = T))
+# 
+# lmFold4_log = lm(log10(mean_y)~log10(mean_x), data = avg_marker_exp_df) 
+
+
+fold1_intr = lmFold1_log$coefficients['(Intercept)']
+fold2_intr = lmFold2_log$coefficients['(Intercept)']
+#fold3_intr = lmFold3_log$coefficients['(Intercept)']
+#fold4_intr = lmFold4_log$coefficients['(Intercept)']
+
+fold1_coef1 = lmFold1_log$coefficients['log10(mean_x)']
+fold2_coef1 = lmFold2_log$coefficients['log10(mean_x)']
+#fold3_coef1 = lmFold3_log$coefficients['log10(mean_x)']
+#fold4_coef1 = lmFold4_log$coefficients['log10(mean_x)']
+
+avg_intr = mean(c(fold1_intr, fold2_intr))
+avg_coef1 =mean(c(fold1_coef1, fold2_coef1))
+
+
+
+#And now test the models on the left out bin
+predict_bin = current_markers[final_bin_index]
+#Get the average rpkm in each sample of the x and y half markers
+left_over_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[!gene_symbol %in% predict_bin], na.rm = T),
+                                                                   mean_y = mean(RPKM[gene_symbol %in% predict_bin], na.rm = T))
+
+
+fold1_pred_y = (left_over_df$mean_x * fold1_coef1) + fold1_intr
+fold2_pred_y = (left_over_df$mean_x * fold2_coef1) + fold2_intr
+#fold3_pred_y = (left_over_df$mean_x * fold3_coef1) + fold3_intr
+#fold4_pred_y = (left_over_df$mean_x * fold4_coef1) + fold4_intr
+avg_pred_y = (left_over_df$mean_x * avg_coef1) + avg_intr
+
+
+y_values = left_over_df$mean_y
+
+caret::postResample(fold1_pred_y , y_values)
+caret::postResample(fold2_pred_y , y_values)
+#caret::postResample(fold3_pred_y , y_values)
+#caret::postResample(fold4_pred_y , y_values)
+caret::postResample(avg_pred_y , y_values)
+
+
+
+
+```
+
+Now try predicting the average expression of all genes except one, using that left out gene's performance.
+Maybe can narrow down the gene feature selection to good performing genes.
+Compare the each gene's model performance to the MetaMarker stats. Are good predictors better markers? Higher expressed?
+
+
+use the fetal training dataset and save all the gene specific model stats to compare to expression levels
+
+```{r}
+
+training_set_fetal_bulk_counts = all_fetal_bulk_counts %>% filter(donor_name %in% fetal_split_1_donors)
+test_set_fetal_bulk_counts = all_fetal_bulk_counts %>% filter(donor_name %in% fetal_split_2_donors)
+
+gc()
+
+```
+
+
+
+
+```{r}
+all_celltypes = c('Glutamatergic','GABAergic','Non-neuronal','Dividing_Progenitor','Intermediate_Progenitor','Neural_Progenitor','Microglia/Immune')
+all_gene_specific_set_1_dfs = list()
+
+for(c in 1:length(all_celltypes)){
+
+  current_celltype = all_celltypes[c]
+  
+  marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  current_markers = unique(marker_exp_df$gene_symbol)
+  
+  
+  all_gene_r2 = vector(mode = 'numeric', length = length(current_markers))
+  all_gene_rmse = vector(mode = 'numeric', length = length(current_markers))
+
+  for(i in 1:length(current_markers)){
+    
+    current_gene = current_markers[i]
+    #Get the average rpkm in each sample of the x and y half markers
+    avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(gene_x = RPKM[gene_symbol == current_gene],
+                                                     mean_y = mean(RPKM[gene_symbol != current_gene], na.rm = T))
+    
+    gene_lm = lm(log10(mean_y+1)~log10(gene_x+1), data = avg_marker_exp_df) 
+    
+    all_gene_r2[i] = summary(gene_lm)$r.squared
+    all_gene_rmse[i] = summary(gene_lm)$sigma
+  
+  }
+
+
+  gene_specific_model_df = data.frame(gene = current_markers, r2 = all_gene_r2, rmse = all_gene_rmse, 
+                                      fetal_metaMarker = rep(current_celltype, length = length(current_markers)))
+  
+  all_gene_specific_set_1_dfs[[c]] = gene_specific_model_df
+  
+  p1 = ggplot(gene_specific_model_df, aes(x = r2, y = rmse)) + geom_point() + 
+    ggtitle(sprintf('Individual genes as predictors: %s', current_celltype))
+  
+  agg_best_r2 = vector(mode = 'numeric')
+
+  for(i in 1:50){
+    top_gene_indv_predictors = gene_specific_model_df %>%top_n(i, r2) %>% pull(gene)
+  
+    #Get the average rpkm in each sample of the x and y half markers
+    avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_gene_indv_predictors], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_gene_indv_predictors], na.rm = T))
+    
+    
+    gene_lm = lm(log10(mean_y +1)~log10(mean_x +1), data = avg_marker_exp_df) 
+    agg_best_r2[i] = summary(gene_lm)$r.squared
+  
+  }
+
+  
+  agg_best_r2_df = data.frame(aggregate_genes = 1:50, r2 = agg_best_r2)
+  
+  p2 = ggplot(agg_best_r2_df, aes(x = aggregate_genes, y = r2)) + geom_point() + ylim(0,1) +
+    ggtitle(sprintf('Aggregating top genes as predictors: %s', current_celltype))
+  
+  print(p1)
+  print(p2)
+
+}
+```
+
+compare gene model stats to average gene expression
+```{r}
+
+all_gene_specific_set_1_dfs = do.call('rbind', all_gene_specific_set_1_dfs)
+
+index = match(all_gene_specific_set_1_dfs$gene, avg_fetal_gene_exp_df$gene_symbol )
+all_gene_specific_set_1_dfs$mean_RPKM = avg_fetal_gene_exp_df$mean_RPKM[index]
+
+
+ggplot(all_gene_specific_set_1_dfs, aes(y = r2, x = log10(mean_RPKM))) + geom_point() +
+  facet_wrap(~fetal_metaMarker, scales = 'free')
+
+
+all_gene_specific_set_1_dfs %>% group_by(fetal_metaMarker) %>% summarise(exp_corr = cor(mean_RPKM, r2, method = 'spearman'))
+
+
+```
+
+
+
+```{r}
+all_celltypes = c('Glutamatergic','GABAergic','Non-neuronal','Dividing_Progenitor','Intermediate_Progenitor','Neural_Progenitor','Microglia/Immune')
+all_gene_specific_set_2_dfs = list()
+
+for(c in 1:length(all_celltypes)){
+
+  current_celltype = all_celltypes[c]
+  
+  marker_exp_df = test_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  current_markers = unique(marker_exp_df$gene_symbol)
+  
+  
+  all_gene_r2 = vector(mode = 'numeric', length = length(current_markers))
+  all_gene_rmse = vector(mode = 'numeric', length = length(current_markers))
+
+  for(i in 1:length(current_markers)){
+    
+    current_gene = current_markers[i]
+    #Get the average rpkm in each sample of the x and y half markers
+    avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(gene_x = RPKM[gene_symbol == current_gene],
+                                                     mean_y = mean(RPKM[gene_symbol != current_gene], na.rm = T))
+    
+    gene_lm = lm(log10(mean_y+1)~log10(gene_x+1), data = avg_marker_exp_df) 
+    
+    all_gene_r2[i] = summary(gene_lm)$r.squared
+    all_gene_rmse[i] = summary(gene_lm)$sigma
+  
+  }
+
+
+  gene_specific_model_df = data.frame(gene = current_markers, r2 = all_gene_r2, rmse = all_gene_rmse, 
+                                      fetal_metaMarker = rep(current_celltype, length = length(current_markers)))
+  
+  all_gene_specific_set_2_dfs[[c]] = gene_specific_model_df
+  
+  p1 = ggplot(gene_specific_model_df, aes(x = r2, y = rmse)) + geom_point() + 
+    ggtitle(sprintf('Individual genes as predictors: %s', current_celltype))
+  
+  agg_best_r2 = vector(mode = 'numeric')
+
+  for(i in 1:50){
+    top_gene_indv_predictors = gene_specific_model_df %>%top_n(i, r2) %>% pull(gene)
+  
+    #Get the average rpkm in each sample of the x and y half markers
+    avg_marker_exp_df = marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_gene_indv_predictors], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_gene_indv_predictors], na.rm = T))
+    
+    
+    gene_lm = lm(log10(mean_y +1)~log10(mean_x +1), data = avg_marker_exp_df) 
+    agg_best_r2[i] = summary(gene_lm)$r.squared
+  
+  }
+
+  
+  agg_best_r2_df = data.frame(aggregate_genes = 1:50, r2 = agg_best_r2)
+  
+  p2 = ggplot(agg_best_r2_df, aes(x = aggregate_genes, y = r2)) + geom_point() + ylim(0,1) +
+    ggtitle(sprintf('Aggregating top genes as predictors: %s', current_celltype))
+  
+  print(p1)
+  print(p2)
+
+}
+```
+
+
+```{r}
+
+all_gene_specific_set_2_dfs = do.call('rbind', all_gene_specific_set_2_dfs)
+
+index = match(all_gene_specific_set_2_dfs$gene, avg_fetal_gene_exp_df$gene_symbol )
+all_gene_specific_set_2_dfs$mean_RPKM = avg_fetal_gene_exp_df$mean_RPKM[index]
+
+
+ggplot(all_gene_specific_set_2_dfs, aes(y = r2, x = log10(mean_RPKM))) + geom_point() +
+  facet_wrap(~fetal_metaMarker, scales = 'free')
+
+
+all_gene_specific_set_2_dfs %>% group_by(fetal_metaMarker) %>% summarise(exp_corr = cor(mean_RPKM, r2, method = 'spearman'))
+
+
+```
+
+
+```{r}
+all_gene_specific_set_1_dfs %>% group_by(fetal_metaMarker) %>% top_n(10, r2)
+
+all_gene_specific_set_2_dfs %>% group_by(fetal_metaMarker) %>% top_n(10, r2)
+
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Glutamatergic') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Glutamatergic') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "Glutamatergic marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'GABAergic') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'GABAergic') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "GABAergic marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Non-neuronal') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Non-neuronal') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "Non-neuronal marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Dividing_Progenitor') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Dividing_Progenitor') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "Dividing_progenitor marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Neural_Progenitor') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Neural_Progenitor') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "Neural_Progenitor marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Intermediate_Progenitor') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Intermediate_Progenitor') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "Intermediate_Progenitor marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+x = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == 'Microglia/Immune') %>% pull(r2)
+y = all_gene_specific_set_2_dfs %>% filter(fetal_metaMarker == 'Microglia/Immune') %>% pull(r2)
+par(pty = 's')
+plot(x, y, main = "MIcroglia/Immune marker's R-squared", ylab = 'test_fetal_set', xlab = 'training_fetal_set')
+
+
+```
+
+
+
+
+Compare the performance of the marker sets to randomly sampled sets of genes
+```{r}
+
+#First grab the r.squared of all the metaMarker models
+metaMarker_model_performance = vector(mode = 'numeric', length = length(all_celltypes))
+names(metaMarker_model_performance) = all_celltypes
+
+for(c in 1:length(all_celltypes)){
+  current_celltype = all_celltypes[c]
+  
+  training_marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  top_best_genes = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == current_celltype) %>% top_n(10, r2) %>% pull(gene)
+  
+  #Get the model using these genes in the training fetal data
+  training_avg_marker_exp_df = training_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_genes], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_best_genes], na.rm = T))
+  
+  
+  training_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = training_avg_marker_exp_df) 
+  metaMarker_model_performance[current_celltype] = summary(training_fetal_lm)$r.squared
+
+}
+
+
+#And now do random sets of 100 genes, still picking the top 10 individual genes per random 100 sample
+all_non_markers = unique(training_set_fetal_bulk_counts %>% filter(is.na(fetal_metaMarker)) %>% pull(gene_symbol))
+num_rand_samps = 100
+gene_sample_size = 100
+random_model_performance = vector(mode = 'numeric', length = num_rand_samps)
+
+for(j in 1:num_rand_samps){
+
+  current_gene_sample = sample(all_non_markers, size = gene_sample_size)
+  current_gene_counts = training_set_fetal_bulk_counts %>% filter(gene_symbol %in% current_gene_sample)
+  
+  #Go through and get the top 10 best genes in this random sample
+  all_gene_r2 = vector(mode = 'numeric', length = length(current_gene_sample))
+  all_gene_rmse = vector(mode = 'numeric', length = length(current_gene_sample))
+  
+  for(i in 1:length(current_gene_sample)){
+    current_gene = current_gene_sample[i]
+    #Get the average rpkm in each sample of the x and y half markers
+    avg_gene_exp_df = current_gene_counts %>% group_by(sample) %>% summarise(gene_x = RPKM[gene_symbol == current_gene],
+                                                     mean_y = mean(RPKM[gene_symbol != current_gene], na.rm = T))
+    
+    gene_lm = lm(log10(mean_y+1)~log10(gene_x+1), data = avg_gene_exp_df) 
+    
+    all_gene_r2[i] = summary(gene_lm)$r.squared
+    all_gene_rmse[i] = summary(gene_lm)$sigma
+  
+  }
+  
+  gene_specific_model_df = data.frame(gene = current_gene_sample, r2 = all_gene_r2, rmse = all_gene_rmse)
+  top_best_random_genes = gene_specific_model_df %>% top_n(10, r2) %>% pull(gene)
+    
+  #Get the model using these genes in the training fetal data
+  avg_random_marker_exp_df = current_gene_counts %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_random_genes], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_best_random_genes], na.rm = T))
+  
+  random_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = avg_random_marker_exp_df) 
+  random_model_performance[j] = summary(random_fetal_lm)$r.squared
+
+}
+
+
+rand_metaMarker_perf_df = data.frame(model_r2 = c(metaMarker_model_performance, random_model_performance),
+                                     sample_type = c(names(metaMarker_model_performance), rep('Random', length = length(random_model_performance))))
+```
+
+
+```{r}
+library(ggrepel)
+
+
+class_palette = MetBrewer::met.brewer("Archambault", 20)
+
+fetal_class_palette = c('Non-neuronal' = class_palette[20], 'GABAergic' = class_palette[1], 'Glutamatergic' = class_palette[14], 'Neural_Progenitor' = class_palette[4], 
+                  'Dividing_Progenitor' = class_palette[10], 'Intermediate_Progenitor' = class_palette[16], 'Microglia/Immune' = class_palette[18],
+                  'other' = 'grey', 'unassigned' = 'grey', 'Vasculature'= 'red', 'NA' = 'grey')
+
+alpha_palette = c('Non-neuronal' = 1, 'GABAergic' = 1, 'Glutamatergic' = 1, 'Neural_Progenitor' = 1, 
+                  'Dividing_Progenitor' = 1, 'Intermediate_Progenitor' = 1, 'Microglia/Immune' = 1,
+                  'NA' = .1)
+
+rand_metaMarker_perf_df$gene_set = c(rep('MetaMarkers', length = 7), rep('Random', length = num_rand_samps))
+
+rand_metaMarker_perf_df$sample_label = rand_metaMarker_perf_df$sample_type
+rand_metaMarker_perf_df$sample_label[rand_metaMarker_perf_df$sample_label == 'Random'] = NA
+rand_metaMarker_perf_df$alpha_label = rand_metaMarker_perf_df$sample_type
+rand_metaMarker_perf_df$alpha_label[rand_metaMarker_perf_df$alpha_label == 'Random'] = 'NA'
+
+ggplot(rand_metaMarker_perf_df, aes(x = gene_set, y = model_r2, label = sample_label)) + 
+  geom_boxplot(fill = 'grey') + theme_classic() +
+  geom_label_repel(nudge_x = 1, nudge_y = .1) +
+  geom_point(size = 3, aes(color = sample_label, alpha = alpha_label), show.legend = F) +
+  scale_color_manual(values = fetal_class_palette) +
+  scale_alpha_manual(values = alpha_palette) +
+  ylab('Model performance (R-squared)') + xlab('Gene set') +
+  ggtitle('Predicting intra-gene set bulk-RNA expression levels')
+
+ggsave(filename = 'metaMarker_and_random_model_perf_boxplots.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/', height = 4, width = 6)
+
+```
+
+
+Now compare performance across the celltypes, use the Glut model to predict the other celltypes expression
+```{r}
+
+full_model_predict_mat = matrix(data = NA, nrow = length(all_celltypes), ncol = length(all_celltypes), dimnames = list(all_celltypes, all_celltypes))
+model_weight_predict_mat = matrix(data = NA, nrow = length(all_celltypes), ncol = length(all_celltypes), dimnames = list(all_celltypes, all_celltypes))
+
+for(c in 1:length(all_celltypes)){
+  
+  current_celltype = all_celltypes[c]
+  
+  training_marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  top_best_genes = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == current_celltype) %>% top_n(10, r2) %>% pull(gene)
+  
+  #Get the model using these genes in the training fetal data
+  training_avg_marker_exp_df = training_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_genes], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_best_genes], na.rm = T))
+  
+
+  training_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = training_avg_marker_exp_df) 
+  
+  y_intr = training_fetal_lm$coefficients['(Intercept)']
+  x_exp_coef = training_fetal_lm$coefficients['log10(mean_x + 1)']
+  
+  glut_predicted_y = (log10(training_avg_marker_exp_df$mean_x+1)*x_exp_coef) + y_intr
+  
+  #Grab the average expression of another marker set
+  for(j in 1:length(all_celltypes)){
+  
+    other_celltype = all_celltypes[j]
+    
+    other_top_best_genes = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == other_celltype) %>% top_n(10, r2) %>% pull(gene)
+    other_training_avg_marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == other_celltype) %>% 
+      group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% other_top_best_genes], na.rm = T),
+                                                       mean_y = mean(RPKM[!gene_symbol %in% other_top_best_genes], na.rm = T))
+    
+    #other_training_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = other_training_avg_marker_exp_df) 
+    
+    glut_model_pred_y = (log10(other_training_avg_marker_exp_df$mean_x + 1) * x_exp_coef) + y_intr
+    other_y_obs = log10(other_training_avg_marker_exp_df$mean_y + 1)
+    
+    full_model_results = caret::postResample(glut_predicted_y  , other_y_obs )
+    full_model_predict_mat[c, j] = full_model_results['RMSE']
+    model_weights_results = caret::postResample(glut_model_pred_y  , other_y_obs )
+    model_weight_predict_mat[c, j] = model_weights_results['RMSE']
+
+  }
+
+}
+
+full_model_predict_mat
+
+model_weight_predict_mat
+
+col_func = circlize::colorRamp2(breaks = c(0,max(full_model_predict_mat)), colors = c('blue','red'))
+ComplexHeatmap::Heatmap(full_model_predict_mat, name = 'RMSE', column_title = 'row model predict column expression',
+                         col = col_func)
+
+col_func = circlize::colorRamp2(breaks = c(0,max(model_weight_predict_mat)), colors = c('blue','red'))
+ComplexHeatmap::Heatmap(model_weight_predict_mat, name = 'RMSE', column_title = 'row model weights predict column expression',
+                        col = col_func)
+
+
+
+
+```
+
+
+training_set_fetal_bulk_counts
+
+
+```{r}
+
+all_top_best_genes = all_gene_specific_set_1_dfs %>% group_by(fetal_metaMarker) %>% top_n(10, r2) %>% pull(gene)
+
+training_set_fetal_bulk_counts %>% filter(gene_symbol %in% all_top_best_genes ) %>% group_by(sample, fetal_metaMarker) %>%
+  summarise(mean_rpkm = mean(RPKM)) %>% group_by(fetal_metaMarker) %>% summarise(mean_marker = mean(log10(mean_rpkm + 1)))
+
+```
+
+
+
+
+Looks like using just the top 5-10 individual predictor genes per cell-type gives the best performance
+
+Now, using those top genes, build a model with the training fetal data and test the performance in the test fetal data set, same with the organoid samples
+
+Also plot the y = x values with the fetal linear model 
+
+```{r}
+org_region_cols = c('cortical' = 'firebrick','subpallial' = 'darkblue','ipsc' = 'goldenrod','spinal' = 'darkviolet', 'Test Fetal' = 'black')
+
+
+all_test_fetal_samples = unique(test_set_fetal_bulk_counts$sample)
+all_org_samples = unique(org_norm_counts$sample)
+
+#test_fetal_sample_performance_df = data.frame(sample = all_test_fetal_samples)
+#organoid_performance_df = data.frame(sample = all_org_samples)
+
+#test_fetal_sample_norm_performance_df = data.frame(sample = all_test_fetal_samples)
+#organoid_norm_performance_df = data.frame(sample = all_org_samples)
+
+test_fetal_pred_df = data.frame(sample = all_test_fetal_samples)
+test_fetal_obs_df = data.frame(sample = all_test_fetal_samples)
+#test_fetal_obs_x_df = data.frame(sample = all_test_fetal_samples)
+
+
+org_pred_df = data.frame(sample = all_org_samples)
+org_obs_df = data.frame(sample = all_org_samples)
+#org_obs_x_df = data.frame(sample = all_org_samples)
+
+
+for(c in 1:length(all_celltypes)){
+
+  current_celltype = all_celltypes[c]
+  
+  training_marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  
+  top_best_genes = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == current_celltype) %>% top_n(10, r2) %>% pull(gene)
+  
+  #Get the model using these genes in the training fetal data
+  training_avg_marker_exp_df = training_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_genes], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_best_genes], na.rm = T))
+  
+  training_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = training_avg_marker_exp_df) 
+
+
+  training_b = unname(training_fetal_lm$coefficients['(Intercept)'])
+  training_m = unname(training_fetal_lm$coefficients['log10(mean_x + 1)'])
+
+  #Get the model error for the testing et of fetal data
+  test_fetal_marker_exp_df = test_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  
+  avg_test_fetal_marker_exp_df = test_fetal_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_genes], na.rm = T),
+                                  mean_y = mean(RPKM[!gene_symbol %in% top_best_genes], na.rm = T))
+  
+  fetal_predicted_values = predict(training_fetal_lm, avg_test_fetal_marker_exp_df )
+  fetal_obs_values = log10(avg_test_fetal_marker_exp_df$mean_y+1)
+
+  test_fetal_pred_df[ ,current_celltype] = fetal_predicted_values
+  test_fetal_obs_df[ ,current_celltype] = fetal_obs_values
+
+  #And now the organoid error
+  org_marker_exp_df = org_norm_counts %>% filter(fetal_metaMarker == current_celltype)
+
+  avg_org_marker_exp = org_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene %in% top_best_genes ], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene %in% top_best_genes ], na.rm = T))
+
+  org_predicted_values = predict(training_fetal_lm, avg_org_marker_exp)
+  org_obs_values = log10(avg_org_marker_exp$mean_y+1)
+  
+  org_pred_df[ ,current_celltype] = org_predicted_values
+  org_obs_df[ ,current_celltype] = org_obs_values
+
+  #Error values
+  #org_error_1 = abs(org_obs_values - org_predicted_values) 
+  #org_error_prop_weight_sq = org_error_1 / (abs(org_obs_values)+.000001)^2
+
+  
+  #Plot y = x
+  avg_test_fetal_marker_exp_df$Region = rep('Test Fetal', length = nrow(avg_test_fetal_marker_exp_df))
+  
+  #Add the organoid region data 
+  index = match(avg_org_marker_exp$sample, org_bulk_meta$Sample_ID )
+  avg_org_marker_exp$Region = org_bulk_meta$Region[index]
+  
+  plotting_df = rbind( avg_org_marker_exp, avg_test_fetal_marker_exp_df)
+  
+  p2 = ggplot(plotting_df, aes(x = log10(mean_x + 1), y = log10(mean_y+1), color = Region)) + geom_point(alpha = .75) +
+    geom_abline(slope = training_m, intercept = training_b, linetype = 'dashed', color = 'red') +
+    ylim(0,3) + xlim(0,3) + ylab(sprintf('%s Y', current_celltype)) + xlab(sprintf('%s X', current_celltype)) +
+    ggtitle(sprintf('Test data vs Fetal %s linear model', current_celltype)) +
+    scale_color_manual(values = org_region_cols)
+  
+  print(p2)
+  
+  
+  #Save in dataframes
+  #Original absolute error score
+  #organoid_performance_df[ , current_celltype] = org_error
+  #test_fetal_sample_performance_df[ , current_celltype]= fetal_error
+
+}
+
+test_fetal_pred_df
+
+```
+
+
+```{r}
+#fetal_class_palette = c('Non-neuronal' = class_palette[20], 'GABAergic' = class_palette[1], 'Glutamatergic' = class_palette[14], 'Neural_Progenitor' = class_palette[4], 
+#                  'Dividing_Progenitor' = class_palette[10], 'Intermediate_Progenitor' = class_palette[16], 'Microglia/Immune' = class_palette[18],
+#                  'other' = 'grey', 'unassigned' = 'grey', 'Vasculature'= 'red', 'NA' = 'grey')
+
+
+
+test_df_1 = reshape2::melt(test_fetal_pred_df, value.name = 'predicted_value')
+test_df_2 = reshape2::melt(test_fetal_obs_df, value.name = 'observed_value')
+
+fetal_model_results = test_df_2
+fetal_model_results$predicted_value = test_df_1$predicted_value
+
+fetal_model_results$resid_error = abs(fetal_model_results$predicted_value - fetal_model_results$observed_value)
+fetal_model_results$error_prop_weight_sq = fetal_model_results$resid_error / (abs(fetal_model_results$observed_value)+.000001)^2
+
+
+
+
+test_df_1 = reshape2::melt(org_pred_df, value.name = 'predicted_value')
+test_df_2 = reshape2::melt(org_obs_df, value.name = 'observed_value')
+
+org_model_results = test_df_2
+org_model_results$predicted_value = test_df_1$predicted_value
+
+org_model_results$resid_error = abs(org_model_results$predicted_value - org_model_results$observed_value)
+org_model_results$error_prop_weight_sq = org_model_results$resid_error / (abs(org_model_results$observed_value)+.000001)^2
+
+
+org_model_results$sample_type = rep('organoid', length = nrow(org_model_results))
+fetal_model_results$sample_type = rep('Test-fetal', length = nrow(fetal_model_results))
+
+index = match(org_model_results$sample, org_bulk_meta$Sample_ID)
+org_model_results$Region = org_bulk_meta$Region[index]
+ 
+fetal_model_results$Region = rep('Test-fetal', length = nrow(fetal_model_results))
+
+
+all_model_results = rbind(org_model_results, fetal_model_results)
+all_model_results 
+
+ggplot(all_model_results, aes(x = Region, y = 1-resid_error, color = Region) ) + geom_boxplot() +
+  facet_wrap(~variable) + ylim(0,1) 
+  
+ggplot(all_model_results, aes(x = Region, y = 1-error_prop_weight_sq, color = Region) ) + geom_boxplot() +
+  facet_wrap(~variable) + ylim(0,1)
+
+```
+
+
+```{r}
+
+fetal_plotting_df = fetal_model_results
+
+ggplot(fetal_plotting_df, aes(x = variable, y = resid_error)) + geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) + ggtitle('Test-fetal data')
+
+ggplot(fetal_plotting_df, aes(x = variable, y = error_prop_weight_sq)) + geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) + ggtitle('Test-fetal data')
+
+
+
+```
+
+
+
+
+
+
+```{r}
+
+org_plotting_df = org_model_results
+
+ggplot(org_plotting_df, aes(x = variable, y = resid_error)) + geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) + ggtitle('Organoid performance')
+
+ggplot(org_plotting_df, aes(x = variable, y = error_prop_weight_sq)) + geom_boxplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) + ggtitle('Organoid performance')
+
+
+```
+
+
+```{r}
+org_region_cols_2 = c('cortical' = 'firebrick','subpallial' = 'darkblue','ipsc' = 'goldenrod','spinal' = 'darkviolet', 'Test-fetal' = 'black')
+
+
+ggplot(all_model_results, aes(x = sample_type, y = 1-error_prop_weight_sq) ) + geom_boxplot() +
+  facet_wrap(~variable, scales = 'free')
+
+#Get the ODS score
+all_model_results$ODS = 1 - all_model_results$error_prop_weight_sq
+
+#Filtering out the ipsc lines
+plotting_model_results = all_model_results %>% filter(Region != 'ipsc' & variable != 'Microglia/Immune' )
+#And rescale the error 
+plotting_model_results = plotting_model_results %>% group_by(variable) %>% mutate( offset_error = ODS + abs(min(ODS))) %>%
+  mutate(scale_error = offset_error / max(offset_error))
+
+order_set = plotting_model_results %>% filter(sample_type == 'organoid') %>% group_by(variable) %>% 
+  summarise(median_error = median(scale_error)) %>%
+  arrange(desc(median_error)) %>% pull(variable)
+
+plotting_model_results$variable = factor(plotting_model_results$variable, levels = as.character(order_set))
+
+
+ggplot(plotting_model_results, aes(x = variable, y = scale_error,fill = sample_type)) + 
+  geom_boxplot(alpha = .5) +
+  scale_x_discrete(guide = guide_axis(n.dodge=2)) +
+  ylab('scaled ODS') +
+  scale_fill_manual(values = c('Test-fetal' = 'darkorange', 'organoid' = 'darkorchid')) +
+  ggtitle('Bulk RNA: Predictability of marker gene expression')
+
+ggsave(filename = 'fetal_organoid_model_error_boxplots_v2.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/', height = 4, width = 6)
+
+
+
+ggplot(filter(all_model_results, variable == 'Glutamatergic'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('Glutamatergic')
+ggplot(filter(all_model_results, variable == 'GABAergic'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('GABAergic')
+ggplot(filter(all_model_results, variable == 'Non-neuronal'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('Non-neuronal')
+ggplot(filter(all_model_results, variable == 'Neural_Progenitor'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('Neural Progenitor')
+ggplot(filter(all_model_results, variable == 'Dividing_Progenitor'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('Dividing Progenitor')
+ggplot(filter(all_model_results, variable == 'Intermediate_Progenitor'), aes(x = Region, y = 1-error_prop_weight_sq, fill = Region )) + 
+  geom_boxplot() + ylab('1-Model error (Inverse squared-proportional weighting)') +
+  scale_fill_manual(values = org_region_cols_2) + ggtitle('Intermediate Progenitor')
+
+```
+
+
+correlations of model error over the cell types
+
+Actually seems to be driven by two main groups in the organoid data
+```{r}
+
+x = filter(all_model_results, sample_type == 'organoid' & variable == 'Glutamatergic')$resid_error
+y = filter(all_model_results, sample_type == 'organoid' & variable == 'Dividing_Progenitor')$resid_error
+
+par(pty = 's')
+plot(x, y)
+
+x = filter(all_model_results, sample_type == 'organoid' & variable == 'Glutamatergic')$resid_error
+y = filter(all_model_results, sample_type == 'organoid' & variable == 'Neural_Progenitor')$resid_error
+
+par(pty = 's')
+plot(x, y)
+
+x = filter(all_model_results, sample_type == 'organoid' & variable == 'Glutamatergic')$resid_error
+y = filter(all_model_results, sample_type == 'organoid' & variable == 'Intermediate_Progenitor')$resid_error
+
+par(pty = 's')
+plot(x, y)
+
+
+
+```
+
+
+```{r}
+
+#Filtering out the ipsc samples for the error_scaling
+
+all_model_results$row_num = 1:nrow(all_model_results)
+
+temp_scale_df = all_model_results %>% filter(Region != 'ipsc') %>% group_by(variable) %>% mutate( offset_error = ODS + abs(min(ODS))) %>%
+  mutate(scale_error = offset_error / max(offset_error))
+index = match(all_model_results$row_num, temp_scale_df$row_num )
+all_model_results$scale_error = temp_scale_df$scale_error[index]
+
+table(org_bulk_meta$Sample_ID == filter(all_model_results, sample_type == 'organoid' & variable == 'Glutamatergic')$sample )
+
+
+
+org_bulk_meta$Glutamatergic_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Glutamatergic')$ODS
+org_bulk_meta$GABAergic_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'GABAergic')$ODS
+org_bulk_meta$Non_neuronal_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Non-neuronal')$ODS
+org_bulk_meta$Dividing_Progenitor_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Dividing_Progenitor')$ODS
+org_bulk_meta$Neural_Progenitor_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Neural_Progenitor')$ODS
+org_bulk_meta$Intermediate_Progenitor_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Intermediate_Progenitor')$ODS
+org_bulk_meta$Microglia_ODS = filter(all_model_results, sample_type == 'organoid' & variable == 'Microglia/Immune')$ODS
+
+
+
+
+#Also add the average expression of the metamarker gene sets to each sample
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Glutamatergic') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Glutamatergic_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'GABAergic') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$GABAergic_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Non-neuronal') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Non_neuronal_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Dividing_Progenitor') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Dividing_Progenitor_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Neural_Progenitor') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Neural_Progenitor_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Intermediate_Progenitor') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Intermediate_Progenitor_mean_RPKM = mean_exp_df$mean_RPKM[index]
+mean_exp_df = org_norm_counts %>% filter(fetal_metaMarker == 'Microglia/Immune') %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$Microglia_mean_RPKM = mean_exp_df$mean_RPKM[index]
+
+```
+
+And add the average expression of the stress gene sets
+
+```{r}
+stress_genes_df = data.table::fread('/home/werner/projects/organoid_variability/data/meta_org_plos_supp_table_4_stress.csv')
+stress_genes_df
+
+er_stress = stress_genes_df %>% filter(module == 'organoid_human_ER_stress_module') %>% pull(gene)
+oxidative_stress = stress_genes_df %>% filter(module == 'organoid_human_oxidative_stress_module') %>% pull(gene)
+glycolytic_stress = stress_genes_df %>% filter(module == 'GO:0061621 - canonical glycolysis') %>% pull(gene)
+
+mean_exp_df = org_norm_counts %>% filter(gene %in% er_stress) %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$ER_stress_mean_RPKM = mean_exp_df$mean_RPKM[index]
+
+mean_exp_df = org_norm_counts %>% filter(gene %in% oxidative_stress) %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$oxidative_stress_mean_RPKM = mean_exp_df$mean_RPKM[index]
+
+mean_exp_df = org_norm_counts %>% filter(gene %in% glycolytic_stress) %>% group_by(sample) %>% summarise(mean_RPKM = mean(RPKM, na.rm = T))
+index = match(org_bulk_meta$Sample_ID , mean_exp_df$sample)
+org_bulk_meta$glycolytic_stress_mean_RPKM = mean_exp_df$mean_RPKM[index]
+
+```
+
+
+```{r}
+col_index = which(!colnames(org_bulk_meta) %in% c('Sample_ID','Line','Age','Date.of.differentiation','Region','Version','Condition'))
+temp_corr_mat = org_bulk_meta[ ,..col_index]
+
+cor(temp_corr_mat, method = 'spearman', use = 'pairwise.complete.obs')
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r}
+
+ggplot(org_bulk_meta, aes(x = Line, y = Glutamatergic_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Date.of.differentiation, y = Glutamatergic_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Region, y = Glutamatergic_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Version, y = Glutamatergic_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Condition, y = Glutamatergic_ODS)) + geom_boxplot()
+
+
+ggplot(org_bulk_meta, aes(x = Line, y = Non_neuronal_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Date.of.differentiation, y = Non_neuronal_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Region, y = Non_neuronal_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Version, y = Non_neuronal_ODS)) + geom_boxplot()
+ggplot(org_bulk_meta, aes(x = Condition, y = Non_neuronal_ODS)) + geom_boxplot()
+```
+
+
+```{r}
+par(pty= 's')
+plot(org_bulk_meta$Glutamatergic_ODS,org_bulk_meta$Glutamatergic_mean_RPKM )
+
+
+
+ggplot(org_bulk_meta, aes(x = Glutamatergic_ODS, y = glycolytic_stress_mean_RPKM, color = Region)) +
+  geom_point()
+ggplot(org_bulk_meta, aes(x = Glutamatergic_ODS, y = ER_stress_mean_RPKM, color = Age)) +
+  geom_point()
+ggplot(org_bulk_meta, aes(x = Glutamatergic_ODS, y = oxidative_stress_mean_RPKM, color = Line)) +
+  geom_point()
+```
+
+Save results up till now
+
+```{r}
+
+fetal_model_results = all_model_results %>% filter(Region == 'Test-fetal')
+
+
+fetal_simple = brainSpan_bulk_meta[, c('donor_id','donor_name', 'age','gender','structure_id', 'structure_acronym', 'structure_name') ]
+fetal_simple$sample_structure = paste(fetal_simple$donor_name, fetal_simple$structure_acronym, sep = '_')
+fetal_simple = fetal_simple %>% filter(donor_name %in% fetal_split_2_donors)
+
+
+
+fetal_glut_results = fetal_model_results %>% filter(variable == 'Dividing_Progenitor')
+table(fetal_glut_results$sample == fetal_simple$sample_structure)
+
+
+
+fetal_simple$Glutamatergic_ODS = filter(fetal_model_results, variable == 'Glutamatergic')$ODS
+fetal_simple$GABAergic_ODS = filter(fetal_model_results, variable == 'GABAergic')$ODS
+fetal_simple$Non_neuronal_ODS = filter(fetal_model_results, variable == 'Non-neuronal')$ODS
+fetal_simple$Intermediate_Progenitor_ODS = filter(fetal_model_results, variable == 'Intermediate_Progenitor')$ODS
+fetal_simple$Neural_Progenitor_ODS = filter(fetal_model_results, variable == 'Neural_Progenitor')$ODS
+fetal_simple$Dividing_Progenitor_ODS = filter(fetal_model_results, variable == 'Dividing_Progenitor')$ODS
+fetal_simple$Microglia_ODS = filter(fetal_model_results, variable == 'Microglia/Immune')$ODS
+#index = match(test_fetal_sample_performance_df$sample, brainSpan_bulk_meta$sample_name)
+#test_fetal_metdata = brainSpan_bulk_meta[index, c('donor_id','donor_name', 'age','gender','structure_id', 'structure_acronym', 'structure_name') ]
+
+#test_fetal_ODS_scores_df = cbind(test_fetal_sample_performance_df, test_fetal_metdata )
+#test_fetal_norm_ODS_scores_df = cbind(test_fetal_sample_norm_performance_df, test_fetal_metdata )
+
+
+
+
+test_fetal_ODS_scores_df = fetal_simple
+
+org_ODS_scores_df = org_bulk_meta
+
+save(all_model_results,org_ODS_scores_df, test_fetal_ODS_scores_df , file = '/home/werner/projects/organoid_variability/data/26_3_25_ODS_score_meta_dfs.Rdata' )
+
+write_csv(org_ODS_scores_df, file ='/home/werner/projects/organoid_variability/data/26_3_25_organoid_ODS_score_meta.csv' )
+
+
+```
+
+```{r}
+
+temp_org_scores = org_ODS_scores_df %>% select(-c(Microglia_ODS, Glutamatergic_mean_RPKM, GABAergic_mean_RPKM, Non_neuronal_mean_RPKM, 
+                                                  Dividing_Progenitor_mean_RPKM, Neural_Progenitor_mean_RPKM, Intermediate_Progenitor_mean_RPKM, 
+                                                  Microglia_mean_RPKM, ER_stress_mean_RPKM, oxidative_stress_mean_RPKM, glycolytic_stress_mean_RPKM))
+
+
+temp_org_scores$sample_type = rep('organoid', length = nrow(temp_org_scores))
+test_fetal_ODS_scores_df$sample_type = rep('fetal', length = nrow(test_fetal_ODS_scores_df))
+
+temp_fetal_scores = test_fetal_ODS_scores_df %>% select(donor_name, sample_structure, age, gender, structure_name,Glutamatergic_ODS, 
+                                                        GABAergic_ODS, Non_neuronal_ODS, 
+                                                        Intermediate_Progenitor_ODS, Neural_Progenitor_ODS, Dividing_Progenitor_ODS, sample_type)
+
+
+temp_org_scores
+colnames(temp_fetal_scores ) = c('Line/Donor','Sample_ID','Age','gender','Region','Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS',
+                                 'Intermediate_Progenitor_ODS','Neural_Progenitor_ODS','Dividing_Progenitor_ODS','sample_type')
+
+colnames(temp_org_scores) = c('Sample_ID','Line/Donor','Age','Date.of.differentiation','Region','Version','Condition',
+                              'Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS',
+                              'Dividing_Progenitor_ODS','Neural_Progenitor_ODS','Intermediate_Progenitor_ODS','sample_type')
+
+
+temp_fetal_scores$Date.of.differentiation = rep(NA, length = nrow(temp_fetal_scores))
+temp_fetal_scores$Version = rep(NA, length = nrow(temp_fetal_scores))
+temp_fetal_scores$Condition = rep(NA, length = nrow(temp_fetal_scores))
+
+
+temp_fetal_scores = temp_fetal_scores %>% select(-c(gender))
+
+dim(temp_fetal_scores)
+dim(temp_org_scores)
+
+
+table(colnames(temp_fetal_scores) %in% colnames(temp_org_scores))
+
+
+all_scores_df = rbind(temp_org_scores, temp_fetal_scores)
+
+write_csv(all_scores_df, file ='/home/werner/projects/organoid_variability/data/1_4_25_organoid_and_fetal_ODS_score_meta.csv' )
+
+#Sanity check
+
+f = all_scores_df$Glutamatergic_ODS + abs(min(all_scores_df$Glutamatergic_ODS))
+y = f/max(f)
+
+temp_df = data.frame(sample_type = all_scores_df$sample_type, Glut_ods = y)
+ggplot(temp_df, aes(x  = sample_type, y = Glut_ods)) + geom_boxplot()
+```
+
+
+
+
+
+
+```{r}
+load(file = '/home/werner/projects/organoid_variability/data/26_3_25_ODS_score_meta_dfs.Rdata' )
+test_fetal_ODS_scores_df$Region = rep('Test Fetal', length = nrow(test_fetal_ODS_scores_df))
+
+ggplot(org_ODS_scores_df, aes(x = Region, y = Glutamatergic_ODS)) + geom_boxplot() + ylim(0,1)+
+  geom_boxplot(data = test_fetal_ODS_scores_df, aes(x = Region, y = Glutamatergic_ODS), color = 'red' )
+
+ggplot(org_ODS_scores_df, aes(x = Region, y = GABAergic_ODS)) + geom_boxplot() +ylim(0,1)+
+  geom_boxplot(data = test_fetal_ODS_scores_df, aes(x = Region, y = GABAergic_ODS), color = 'red' )
+
+ggplot(org_ODS_scores_df, aes(x = Region, y = Intermediate_Progenitor_ODS)) + geom_boxplot() +
+  geom_boxplot(data = test_fetal_ODS_scores_df, aes(x = Region, y = Intermediate_Progenitor_ODS), color = 'red' )
+
+
+
+org_ODS_scores_df %>% filter(Region == 'ipsc')
+
+```
+
+
+
+```{r}
+library(ggExtra)
+
+org_region_cols = c('cortical' = 'firebrick','subpallial' = 'darkblue','ipsc' = 'goldenrod','spinal' = 'darkviolet', 'Test Fetal' = 'black')
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'GABAergic')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$GABAergic_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(GABAergic_sum_rpkm), y = GABAergic_ODS, color = Region)) + geom_point() +
+  scale_color_manual(values = org_region_cols) + ylab('GABAergic ODS')
+
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'Glutamatergic')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$Glutamatergic_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(Glutamatergic_sum_rpkm), y = Glutamatergic_ODS, color = Region)) + geom_point() +
+  scale_color_manual(values = org_region_cols) + ylab('Glutamatergic ODS')
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'Intermediate_Progenitor')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$Intermediate_Progenitor_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(Intermediate_Progenitor_sum_rpkm), y = Intermediate_Progenitor_ODS, color = Region)) + geom_point() +
+  scale_color_manual(values = org_region_cols) + ylab('Intermediate Progenitor ODS')
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'Neural_Progenitor')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$Neural_Progenitor_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(Neural_Progenitor_sum_rpkm), y = Neural_Progenitor_ODS, color = Region)) + geom_point()+
+  scale_color_manual(values = org_region_cols) + ylab('Neural_Progenitor ODS')
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'Dividing_Progenitor')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$Dividing_Progenitor_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(Dividing_Progenitor_sum_rpkm), y = Dividing_Progenitor_ODS, color = Region)) + geom_point()+
+  scale_color_manual(values = org_region_cols)  + ylab('Dividing Progenitor ODS')
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+sum_gaba_df = all_bulk_marker_expression %>% filter(fetal_metaMarker == 'Non-neuronal')
+
+index = match(org_ODS_scores_df$Sample_ID, sum_gaba_df$sample)
+org_ODS_scores_df$Non_neuronal_sum_rpkm = sum_gaba_df$sum_rpkm[index]
+
+p1 = ggplot(org_ODS_scores_df, aes(x = log10(Non_neuronal_sum_rpkm), y = Non_neuronal_ODS, color = Region)) + geom_point()+
+  scale_color_manual(values = org_region_cols) + ylab('Non-neuronal ODS')
+ggMarginal(p1, type = 'boxplot', margins = 'x', groupColour = T)
+
+
+
+
+```
+
+
+
+
+
+
+```{r}
+
+temp_corr_mat = org_ODS_scores_df %>% filter(Region == 'cortical' & Age == '30') %>% select('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS')
+
+temp_corr_mat  = cor(temp_corr_mat, method = 'spearman', use = 'pairwise.complete.obs')
+
+
+ComplexHeatmap::Heatmap(temp_corr_mat, name = 'spearman', column_title = 'Bulk cortical',
+               clustering_distance_columns = function(m) dist(1-m), clustering_method_columns = "ward.D2",
+               clustering_distance_rows = function(m) dist(1-m), clustering_method_rows = "ward.D2")
+
+
+
+temp_corr_mat = org_ODS_scores_df %>% filter(Region == 'subpallial' & Age == '30') %>% select('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS')
+
+temp_corr_mat  = cor(temp_corr_mat, method = 'spearman', use = 'pairwise.complete.obs')
+
+
+ComplexHeatmap::Heatmap(temp_corr_mat, name = 'spearman', column_title = 'Bulk subpallial',
+               clustering_distance_columns = function(m) dist(1-m), clustering_method_columns = "ward.D2",
+               clustering_distance_rows = function(m) dist(1-m), clustering_method_rows = "ward.D2")
+
+
+temp_corr_mat = org_ODS_scores_df %>% filter(Region == 'spinal' & Age == '30') %>% 
+  select('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS')
+
+temp_corr_mat  = cor(temp_corr_mat, method = 'spearman', use = 'pairwise.complete.obs')
+
+
+ComplexHeatmap::Heatmap(temp_corr_mat, name = 'spearman', column_title = 'Bulk spinal',
+               clustering_distance_columns = function(m) dist(1-m), clustering_method_columns = "ward.D2",
+               clustering_distance_rows = function(m) dist(1-m), clustering_method_rows = "ward.D2")
+
+
+
+
+```
+
+
+
+
+
+
+For a specific differentiation protocol, plot the glutamatergic and gabaergic ODS scores against each other
+Add in the fetal scores for those cell-types as a marginal distribution 
+Highlighting the variability of cell-type scores within a protocol, using the fetal as a reference
+
+```{r}
+library(patchwork)
+
+```
+
+```{r}
+
+class_palette = MetBrewer::met.brewer("Archambault", 20)
+
+fetal_class_palette = c('Non-neuronal' = class_palette[20], 'GABAergic' = class_palette[1], 'Glutamatergic' = class_palette[14], 'Neural_Progenitor' = class_palette[4], 
+                  'Dividing_Progenitor' = class_palette[10], 'Intermediate_Progenitor' = class_palette[16], 'Microglia/Immune' = class_palette[18],
+                  'other' = 'grey', 'unassigned' = 'grey', 'Vasculature'= 'red', 'NA' = 'grey')
+
+#all_model_results %>% filter(Region == 'Test-fetal' & variable == 'Glutamatergic')
+
+#table(all_model_results$Region)
+
+#fetal_glut_box_df = test_fetal_ODS_scores_df %>% select(sample, Glutamatergic) %>% mutate(cell_type = 'Glutamatergic')
+
+fetal_glut_plot = ggplot(all_model_results %>% filter(Region == 'Test-fetal' & variable == 'Glutamatergic'), 
+                         aes(y = variable, x = scale_error)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['Glutamatergic'], color = 'grey30') +
+  xlim(.25,1) + theme_void()
+
+#fetal_gaba_box_df = test_fetal_ODS_scores_df %>% select(sample, GABAergic) %>% mutate(cell_type = 'GABAergic')
+
+fetal_gaba_plot = ggplot(all_model_results %>% filter(Region == 'Test-fetal' & variable == 'GABAergic'), 
+                         aes(y = variable, x = scale_error)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['GABAergic'], color = 'grey30') +
+  xlim(.25,1) + theme_void()
+
+
+#fetal_nProg_box_df = test_fetal_ODS_scores_df %>% select(sample, Neural_Progenitor) %>% mutate(cell_type = 'Neural_Progenitor')
+
+fetal_nProg_plot = ggplot(all_model_results %>% filter(Region == 'Test-fetal' & variable == 'Neural_Progenitor'), 
+                          aes(x = variable, y = scale_error)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['Neural_Progenitor'], color = 'grey30') +
+  ylim(.25,1) + theme_void()
+
+
+
+#org_score_plot_df = org_ODS_scores_df %>% filter(Region %in% c('cortical'))
+
+org_score_plot_df = all_model_results %>% filter(Region == 'cortical' & variable %in% c('Glutamatergic','Neural_Progenitor')) %>%
+  select(sample, variable, scale_error) %>%
+  pivot_wider(names_from = variable, values_from = scale_error)
+
+p_org = ggplot(org_score_plot_df, aes(x = Glutamatergic, y = Neural_Progenitor)) + 
+  geom_point(fill = 'goldenrod', color = 'black', pch = 21, alpha = .75) + ylim(.25,1) + xlim(.25,1) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1)) +
+  ggtitle('Cortical organoid') + ylab('Bulk-Neural Progenitor ODS') + xlab('Bulk-Glutamatergic ODS')
+
+
+cortical_org_plots = fetal_glut_plot + plot_spacer() +
+  p_org + fetal_nProg_plot
+cortical_org_plots
+
+ggsave(p =cortical_org_plots, filename = 'cortical_organoid_scores_v2.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/',
+       height = 4, width = 4)
+
+
+
+
+org_score_plot_df = all_model_results %>% filter(Region == 'subpallial' & variable %in% c('GABAergic','Neural_Progenitor')) %>%
+  select(sample, variable, scale_error) %>%
+  pivot_wider(names_from = variable, values_from = scale_error)
+
+p_org = ggplot(org_score_plot_df, aes(x = GABAergic, y = Neural_Progenitor)) + 
+  geom_point(fill = 'dodgerblue', color = 'black', pch = 21, alpha = .75) + ylim(.25,1) + xlim(.25,1) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1)) +
+  ggtitle('Subpallial organoid') + ylab('Bulk-Neural Progenitor ODS') + xlab('Bulk-GABAergic ODS')
+
+
+subpallial_org_plots = fetal_gaba_plot + plot_spacer() +
+  p_org + fetal_nProg_plot
+
+subpallial_org_plots
+
+ggsave(p =subpallial_org_plots, filename = 'subpallial_organoid_scores_v2.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/',
+       height = 4, width = 4)
+
+```
+
+
+And now load up the single cell data from the meta-organoid project and do something similar
+
+```{r}
+
+#Organoid metadat data
+all_singeCell_org_sample_meta = read.csv('/vault/werner/meta_qc_organoid/final_plots/meta_organoid_figure_plots/data_for_plots/all_data_just_meta_seurat_with_addl_features_Fig1B_4BC_SuppFig4D_5AC_8A_9ABC_10DE.csv')
+
+#Contains cross_valid_fetal_cons_coexp_df, unannot_sum_cons_coexp_df
+load(file = '/vault/werner/meta_qc_organoid/final_plots/meta_organoid_figure_plots/data_for_plots/fetal_preserve_fetal_coexp_dfs_Fig4B_Fig1F_Fig6B.Rdata' )
+unannot_sum_cons_coexp_df
+
+
+table(all_singeCell_org_sample_meta$Protocol.classification.region)
+
+
+
+sc_fetal_glut_box_df = unannot_sum_cons_coexp_df %>% filter(gene_celltype_label == 'fetal glutamatergic marker') %>% mutate(cell_type = 'Glutamatergic')
+
+sc_fetal_glut_plot = ggplot(sc_fetal_glut_box_df, aes(y = cell_type, x = sum)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['Glutamatergic'], color = 'grey30') +
+  xlim(.6,1) + theme_void()
+
+sc_fetal_gaba_box_df = unannot_sum_cons_coexp_df %>% filter(gene_celltype_label == 'fetal GABAergic marker') %>% mutate(cell_type = 'GABAergic')
+
+sc_fetal_gaba_plot = ggplot(sc_fetal_gaba_box_df, aes(y = cell_type, x = sum)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['GABAergic'], color = 'grey30') +
+  xlim(.6,1) + theme_void()
+
+sc_fetal_nProg_box_df = unannot_sum_cons_coexp_df %>% filter(gene_celltype_label == 'fetal Neural progenitor marker') %>% mutate(cell_type = 'Neural_Progenitor')
+
+sc_fetal_nProg_plot = ggplot(sc_fetal_nProg_box_df, aes(x = cell_type, y= sum)) + 
+  geom_boxplot(width = .25, fill = fetal_class_palette['Neural_Progenitor'], color = 'grey30') +
+  ylim(.6,1) + theme_void()
+
+
+
+
+sc_org_score_plot_df = all_singeCell_org_sample_meta %>% filter(Protocol.classification.region%in% c('undirected'))
+p_org_glut = ggplot(sc_org_score_plot_df, aes(x = glut_cons_coexp_metric, y = nProg_cons_coexp_metric)) + 
+  geom_point(fill = 'darkgreen', color = 'black', pch = 21, alpha = .75) + ylim(.6,1) + xlim(.6,1) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1)) +
+  ggtitle('Single-cell undirected organoid') + ylab('SC-Neural Progenitor ODS') + xlab('SC-Glutamatergic ODS')
+
+sc_undirected_org_plots = sc_fetal_glut_plot+ plot_spacer() +
+  p_org_glut + sc_fetal_nProg_plot
+sc_undirected_org_plots
+
+ggsave(p =sc_undirected_org_plots, filename = 'sc_undirected_organoid_scores.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/',
+       height = 4, width = 4)
+
+
+
+sc_org_score_plot_df = all_singeCell_org_sample_meta %>% filter(Protocol.classification.region%in% c('directed dorsal forebrain'))
+p_org_cortical = ggplot(sc_org_score_plot_df, aes(x = glut_cons_coexp_metric, y = nProg_cons_coexp_metric)) + 
+  geom_point(fill = 'orange', color = 'black', pch = 21, alpha = .75) + ylim(.6,1) + xlim(.6,1) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", linewidth=1)) +
+  ggtitle('Single-cell Dorsal forebrain organoid') + ylab('SC-Neural Progenitor ODS') + xlab('SC-Glutamatergic ODS')
+
+
+sc_cortical_org_plots = sc_fetal_glut_plot+ plot_spacer() +
+  p_org_cortical + sc_fetal_nProg_plot
+sc_cortical_org_plots 
+
+ggsave(p =sc_cortical_org_plots, filename = 'sc_dorsal_forebrain_organoid_scores.pdf', device = 'pdf', useDingbats = F,
+       path = '/home/werner/projects/organoid_variability/graphs/',
+       height = 4, width = 4)
+
+
+```
+
+
+
+##############################################
+Extra data from Sloan and Co. 
+
+12 organoids total, 6 grown in matrigel, 6 grown in some other medium, supposedly have very different patterning
+
+
+```{r}
+
+
+org_ecm_counts = as.data.frame(data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/filtered_featurecounts_FL35_revised.csv'))
+
+rownames(org_ecm_counts) = org_ecm_counts$Geneid
+org_ecm_counts = org_ecm_counts[ , 2:ncol(org_ecm_counts)]
+
+
+#Get the gene metadata
+org_ecm_genes = rownames(org_ecm_counts)
+#Get the metadata associated with the organoid genes
+index = match(org_ecm_genes, human_gtf$gene_name)
+org_ecm_gene_meta = human_gtf[index, c('gene_name','gene_id','gene_type', 'width') ]
+
+org_ecm_gene_meta$width_kilo = org_ecm_gene_meta$width/1000
+
+#And RPKM normalize
+#First compute CPM
+scale_factors = colSums(org_ecm_counts)
+org_ecm_norm_counts = t(t(org_ecm_counts) / scale_factors) * 1e6
+
+
+#Then divide each row by the gene's kilobase, this gives RPKM
+org_ecm_norm_counts = org_ecm_norm_counts / org_ecm_gene_meta$width_kilo
+org_ecm_norm_counts = as.tibble(org_ecm_norm_counts, rownames = 'gene')
+org_ecm_norm_counts[1:10, 1:10]
+
+
+#Pivot longer
+org_ecm_norm_counts = org_ecm_norm_counts %>% pivot_longer(!gene, names_to = 'sample', values_to = 'RPKM')
+org_ecm_norm_counts
+
+
+```
+
+```{r}
+
+
+marker_index = match(org_ecm_norm_counts$gene, top_markers$gene)
+org_ecm_norm_counts$fetal_metaMarker = top_markers$cell_type[marker_index]
+
+
+sum_org_marker_rpkm_df = org_ecm_norm_counts %>% filter(!is.na(fetal_metaMarker)) %>% 
+  group_by(sample, fetal_metaMarker) %>% 
+  summarise(sum_rpkm = sum(RPKM, na.rm = T))
+
+
+ggplot(sum_org_marker_rpkm_df, aes(x = log10(sum_rpkm), y = fetal_metaMarker))  + geom_density_ridges()
+
+
+```
+
+
+```{r}
+all_celltypes = c('Glutamatergic','GABAergic','Non-neuronal','Dividing_Progenitor','Intermediate_Progenitor','Neural_Progenitor','Microglia/Immune')
+
+all_org_ecm_samples = unique(org_ecm_norm_counts$sample)
+
+org_ecm_pred_df = data.frame(sample = all_org_ecm_samples)
+org_ecm_obs_df = data.frame(sample = all_org_ecm_samples)
+
+for(c in 1:length(all_celltypes)){
+
+  current_celltype = all_celltypes[c]
+  
+  training_marker_exp_df = training_set_fetal_bulk_counts %>% filter(fetal_metaMarker == current_celltype)
+  
+  top_best_genes = all_gene_specific_set_1_dfs %>% filter(fetal_metaMarker == current_celltype) %>% top_n(10, r2) %>% pull(gene)
+  
+  #Get the model using these genes in the training fetal data
+  training_avg_marker_exp_df = training_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene_symbol %in% top_best_genes], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene_symbol %in% top_best_genes], na.rm = T))
+  
+  training_fetal_lm = lm(log10(mean_y+1)~log10(mean_x+1), data = training_avg_marker_exp_df) 
+  
+  #coefficients
+  training_b = unname(training_fetal_lm$coefficients['(Intercept)'])
+  training_m = unname(training_fetal_lm$coefficients['log10(mean_x + 1)'])
+
+  #And now the organoid error
+  org_marker_exp_df = org_ecm_norm_counts %>% filter(fetal_metaMarker == current_celltype)
+
+  avg_org_marker_exp = org_marker_exp_df %>% group_by(sample) %>% summarise(mean_x = mean(RPKM[gene %in% top_best_genes ], na.rm = T),
+                                                     mean_y = mean(RPKM[!gene %in% top_best_genes ], na.rm = T))
+
+  org_predicted_values = predict(training_fetal_lm, avg_org_marker_exp)
+  org_obs_values = log10(avg_org_marker_exp$mean_y+1)
+  
+  org_ecm_pred_df[ ,current_celltype] = org_predicted_values
+  org_ecm_obs_df[ ,current_celltype] = org_obs_values
+
+  
+  
+  avg_org_marker_exp$guessed_label = c(rep('ecm_1', length = 6), rep('ecm_2', length = 6))
+
+  p2 = ggplot(avg_org_marker_exp, aes(x = log10(mean_x + 1), y = log10(mean_y+1), color = guessed_label)) + geom_point(alpha = .75) +
+    geom_abline(slope = training_m, intercept = training_b, linetype = 'dashed', color = 'red') +
+    ylim(0,3) + xlim(0,3) + ylab(sprintf('%s Y', current_celltype)) + xlab(sprintf('%s X', current_celltype)) +
+    ggtitle(sprintf('Test data vs Fetal %s linear model', current_celltype)) 
+  
+  print(p2)
+  
+
+}
+
+
+
+```
+
+
+```{r}
+
+test_df_1 = reshape2::melt(org_ecm_pred_df, value.name = 'predicted_value')
+test_df_2 = reshape2::melt(org_ecm_obs_df, value.name = 'observed_value')
+
+org_ecm_model_results = test_df_2
+org_ecm_model_results$predicted_value = test_df_1$predicted_value
+
+org_ecm_model_results$resid_error = abs(org_ecm_model_results$predicted_value - org_ecm_model_results$observed_value)
+org_ecm_model_results$error_prop_weight_sq = org_ecm_model_results$resid_error / (abs(org_ecm_model_results$observed_value)+.000001)^2
+
+org_ecm_model_results$ODS = 1-org_ecm_model_results$error_prop_weight_sq
+
+
+```
+
+
+```{r}
+
+x = filter(org_ecm_model_results, variable == 'Glutamatergic')$ODS
+y = filter(org_ecm_model_results, variable == 'Dividing_Progenitor')$ODS
+
+par(pty = 's')
+plot(x, y, xlab = 'Glutamatergic ODS', ylab = 'Dividing Progenitor ODS')
+
+
+x = filter(org_ecm_model_results, variable == 'Glutamatergic')$ODS
+y = filter(org_ecm_model_results, variable == 'GABAergic')$ODS
+
+par(pty = 's')
+plot(x, y, xlab = 'Glutamatergic ODS', ylab = 'GABAergic ODS')
+
+x = filter(org_ecm_model_results, variable == 'Glutamatergic')$ODS
+y = filter(org_ecm_model_results, variable == 'Intermediate_Progenitor')$ODS
+
+par(pty = 's')
+plot(x, y, xlab = 'Glutamatergic ODS', ylab = 'Intermediate Progenitor ODS')
+
+x = filter(org_ecm_model_results, variable == 'Glutamatergic')$ODS
+y = filter(org_ecm_model_results, variable == 'Neural_Progenitor')$ODS
+
+par(pty = 's')
+plot(x, y, xlab = 'Glutamatergic ODS', ylab = 'Neural Progenitor ODS')
+
+
+```
+
+Just save the ODS scores for sharing
+
+```{r}
+
+org_ecm_ods_df = org_ecm_model_results %>% select(sample, variable, ODS) %>% 
+  pivot_wider(names_from = variable, values_from = ODS) %>% 
+  select(-c(`Microglia/Immune`))
+
+org_ecm_ods_df
+
+```
+
+Save
+```{r}
+write_csv(org_ecm_ods_df, file ='/home/werner/projects/organoid_variability/data/8_4_25_organoid_matrigel_vitronectin_ODS_score.csv' )
+
+
+
+```
+
+
+```{r}
+
+library(factoextra)
+```
+
+
+```{r}
+
+temp_variable_mat = org_ecm_ods_df[ , c(2:ncol(org_ecm_ods_df))]
+org_pca = stats::prcomp(temp_variable_mat, scale = T)
+fviz_eig(org_pca)
+
+
+```
+
+```{r}
+fviz_pca_ind(org_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             label = 'none'
+             )
+
+fviz_pca_var(org_pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             select.var = list(name = c('Glutamatergic','GABAergic','Non_neuronal','Neural_Progenitor',
+                                        'Intermediate_Progenitor','Dividing_Progenitor')),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+
+feature_viz = temp_variable_mat$Glutamatergic
+p_glut = fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Glutamatergic_ODS',
+             label = 'none'
+             )
+
+feature_viz = temp_variable_mat$GABAergic
+p_gaba = fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'GABAergic_ODS',
+             label = 'none'
+             )
+
+feature_viz = temp_variable_mat$`Non-neuronal`
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Non-neuronal_ODS',
+             label = 'none'
+             )
+
+feature_viz = temp_variable_mat$Neural_Progenitor
+p_nprog = fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Neural_Progenitor_ODS',
+             label = 'none'
+             )
+feature_viz = temp_variable_mat$Dividing_Progenitor
+p_divprog = fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Dividing_Progenitor_ODS',
+             label = 'none'
+             )
+
+feature_viz = temp_variable_mat$Intermediate_Progenitor
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Intermediate_Progenitor_ODS',
+             label = 'none'
+             )
+
+
+pdf(file = '/home/werner/projects/organoid_variability/graphs/ecm_pca/bulk_org_diff_ecm_Glut_ODS_PCA.pdf', useDingbats = F,
+    height = 4, width = 6)
+p_glut
+dev.off()
+
+pdf(file = '/home/werner/projects/organoid_variability/graphs/ecm_pca/bulk_org_diff_ecm_GABA_ODS_PCA.pdf', useDingbats = F,
+    height = 4, width = 6)
+p_gaba
+dev.off()
+
+pdf(file = '/home/werner/projects/organoid_variability/graphs/ecm_pca/bulk_org_diff_ecm_nProg_ODS_PCA.pdf', useDingbats = F,
+    height = 4, width = 6)
+p_nprog
+dev.off()
+
+pdf(file = '/home/werner/projects/organoid_variability/graphs/ecm_pca/bulk_org_diff_ecm_divProg_ODS_PCA.pdf', useDingbats = F,
+    height = 4, width = 6)
+p_divprog
+dev.off()
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Trying PCA on the expression and ODS scores
+
+```{r}
+
+library("factoextra")
+```
+
+
+```{r}
+
+col_index = which(colnames(org_ODS_scores_df) %in% c('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS','Microglia_ODS'))
+temp_variable_mat = org_ODS_scores_df[ ,..col_index]
+
+
+org_pca = stats::prcomp(temp_variable_mat, scale = T)
+
+fviz_eig(org_pca)
+
+
+```
+
+```{r}
+fviz_pca_ind(org_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             label = 'none'
+             )
+
+fviz_pca_var(org_pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             select.var = list(name = c('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS','Microglia_ODS')),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+```
+
+
+```{r}
+feature_viz = 1 - org_ODS_scores_df$Glutamatergic_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Glutamatergic_ODS',
+             label = 'none'
+             )
+
+
+feature_viz = 1 - org_ODS_scores_df$GABAergic_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'GABAergic_ODS',
+             label = 'none'
+             )
+
+feature_viz = 1 - org_ODS_scores_df$Non_neuronal_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Non_neuronal_ODS',
+             label = 'none'
+             )
+
+feature_viz = 1 - org_ODS_scores_df$Neural_Progenitor_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Neural_Progenitor_ODS',
+             label = 'none'
+             )
+
+feature_viz = 1 - org_ODS_scores_df$Dividing_Progenitor_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Dividing_Progenitor_ODS',
+             label = 'none'
+             )
+
+
+feature_viz = 1 - org_ODS_scores_df$Intermediate_Progenitor_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Intermediate_Progenitor_ODS',
+             label = 'none'
+             )
+
+feature_viz = 1 - org_ODS_scores_df$Microglia_ODS
+fviz_pca_ind(org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#FC4E07", "#E7B800", "#00AFBB"),
+             legend.title = 'Microglia_ODS',
+             label = 'none'
+             )
+
+```
+
+
+
+```{r}
+
+groups <- as.factor(org_ODS_scores_df$Region)
+fviz_pca_ind(org_pca,
+             col.ind = groups, # color by groups
+             legend.title = "Region",
+             label = 'none'
+             )
+
+
+groups <- as.factor(org_ODS_scores_df$Line)
+fviz_pca_ind(org_pca,
+             col.ind = groups, # color by groups
+             legend.title = "Cell line",
+             label = 'none'
+             )
+
+
+```
+
+
+
+
+```{r}
+temp_variable_mat
+
+colnames(test_fetal_sample_performance_df) = c('sample', 'Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Dividing_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Neural_Progenitor_ODS','Microglia_ODS')
+
+col_index = colnames(test_fetal_sample_performance_df) %in% c('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Dividing_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Neural_Progenitor_ODS','Microglia_ODS')
+temp_fetal_variable_mat = test_fetal_sample_performance_df[ , col_index]
+
+all_samples = c(rep('Organoid', length = nrow(temp_variable_mat)), rep('Fetal', length = nrow(temp_fetal_variable_mat)))
+
+all_temp_variable_mat = rbind(temp_variable_mat, temp_fetal_variable_mat)
+
+
+fetal_org_pca = stats::prcomp(all_temp_variable_mat, scale = T)
+
+fviz_pca_ind(fetal_org_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             label = 'none'
+             )
+
+fviz_pca_var(fetal_org_pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             select.var = list(name = c('Glutamatergic_ODS','GABAergic_ODS','Non_neuronal_ODS','Neural_Progenitor_ODS',
+                                        'Intermediate_Progenitor_ODS','Dividing_Progenitor_ODS','Microglia_ODS')),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+groups <- as.factor(all_samples)
+fviz_pca_ind(fetal_org_pca,
+             col.ind = groups, # color by groups
+             legend.title = "Sample-type",
+             label = 'none'
+             )
+
+```
+
+
+
+
+
+```{r}
+feature_viz = all_temp_variable_mat$Glutamatergic_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Glutamatergic_ODS',
+             label = 'none'
+             )
+
+
+feature_viz = all_temp_variable_mat$GABAergic_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'GABAergic_ODS',
+             label = 'none'
+             )
+
+feature_viz = all_temp_variable_mat$Non_neuronal_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Non_neuronal_ODS',
+             label = 'none'
+             )
+
+feature_viz = all_temp_variable_mat$Neural_Progenitor_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Neural_Progenitor_ODS',
+             label = 'none'
+             )
+
+feature_viz = all_temp_variable_mat$Dividing_Progenitor_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Dividing_Progenitor_ODS',
+             label = 'none'
+             )
+
+
+feature_viz = all_temp_variable_mat$Intermediate_Progenitor_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Intermediate_Progenitor_ODS',
+             label = 'none'
+             )
+
+feature_viz = all_temp_variable_mat$Microglia_ODS
+fviz_pca_ind(fetal_org_pca,
+             col.ind = feature_viz, # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             legend.title = 'Microglia_ODS',
+             label = 'none'
+             )
+
+```
+
+
+
+```{r}
+
+#test_fetal_marker_rpkm_counts = test_set_fetal_bulk_counts %>% filter(gene_symbol %in% top_markers$gene) %>% select(sample, RPKM, gene_symbol) %>%
+#  pivot_wider(names_from = sample, values_from = RPKM)
+
+organoid_marker_rpkm_counts = org_norm_counts %>% filter(gene %in% top_markers$gene) %>% select(sample, RPKM, gene) %>%
+  pivot_wider(names_from = sample, values_from = RPKM)
+
+
+#shared_genes = intersect(test_fetal_marker_rpkm_counts$gene_symbol, organoid_marker_rpkm_counts$gene)
+#length(shared_genes)
+
+#test_fetal_marker_rpkm_counts = test_fetal_marker_rpkm_counts %>% filter(gene_symbol %in% shared_genes)
+#organoid_marker_rpkm_counts = organoid_marker_rpkm_counts %>% filter(gene %in% shared_genes)
+
+
+#gene_index = match(test_fetal_marker_rpkm_counts$gene_symbol, organoid_marker_rpkm_counts$gene)
+#organoid_marker_rpkm_counts = organoid_marker_rpkm_counts[gene_index, ]
+
+#organoid_marker_rpkm_counts = organoid_marker_rpkm_counts %>% select(-gene)
+#test_fetal_marker_rpkm_counts = test_fetal_marker_rpkm_counts %>% select(-gene_symbol)
+
+
+#all_marker_exp_counts = cbind(test_fetal_marker_rpkm_counts, organoid_marker_rpkm_counts)
+
+all_marker_exp_counts = as.data.frame(organoid_marker_rpkm_counts , row.names = organoid_marker_rpkm_counts$gene)
+all_marker_exp_counts = all_marker_exp_counts %>% select(-gene)
+
+
+colnames(all_marker_exp_counts)
+
+table(is.na(all_marker_exp_counts))
+
+all_marker_exp_counts[is.na(all_marker_exp_counts)] = 0
+
+
+all_marker_exp_counts = all_marker_exp_counts[rowSums(all_marker_exp_counts) != 0, ]
+
+
+
+```
+
+```{r}
+
+
+fetal_org_marker_pca = stats::prcomp(t(all_marker_exp_counts), scale = T)
+
+fviz_pca_ind(fetal_org_marker_pca,
+             col.ind = "cos2", # Color by the quality of representation
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             label = 'none'
+             )
+
+
+sample_type = rep('Organoid', length = ncol(all_marker_exp_counts))
+sample_type[grepl('H376', colnames(all_marker_exp_counts))] = 'Fetal'
+groups <- as.factor(sample_type)
+fviz_pca_ind(fetal_org_marker_pca,
+             col.ind = groups, # color by groups
+             legend.title = "Sample-type",
+             label = 'none'
+             )
+
+
+```
+
+
+```{r}
+
+index = match(colnames(all_marker_exp_counts), org_bulk_meta$Sample_ID)
+all_sample_meta =  org_bulk_meta[index, ]
+
+
+groups <- as.factor(all_sample_meta$Line)
+fviz_pca_ind(fetal_org_marker_pca, title = 'Organoid PCA using Fetal MetaMarkers',
+             col.ind = groups, # color by groups
+             legend.title = "Line",
+             label = 'none'
+             )
+
+groups <- as.factor(all_sample_meta$Region)
+fviz_pca_ind(fetal_org_marker_pca,
+             col.ind = groups, # color by groups
+             legend.title = 'Region',
+             label = 'none'
+             )
+
+
+```
+
+
+
+
+
+
+```{r}
+
+top_neuron_genes = top_markers %>% filter(cell_type %in% c('Glutamatergic','GABAergic')) %>% pull(gene)
+
+temp_org_samples = org_bulk_meta %>% filter(Region %in% c('cortical','subpallial')) %>% pull(Sample_ID)
+
+
+
+organoid_marker_rpkm_counts = org_norm_counts %>% filter(gene %in% top_neuron_genes & sample %in% temp_org_samples) %>% 
+  select(sample, RPKM, gene) %>%
+  pivot_wider(names_from = sample, values_from = RPKM)
+
+all_marker_exp_counts = as.data.frame(organoid_marker_rpkm_counts , row.names = organoid_marker_rpkm_counts$gene)
+all_marker_exp_counts = all_marker_exp_counts %>% select(-gene)
+
+all_marker_exp_counts[is.na(all_marker_exp_counts)] = 0
+
+
+all_marker_exp_counts = all_marker_exp_counts[rowSums(all_marker_exp_counts) != 0, ]
+
+fetal_org_marker_pca = stats::prcomp(t(all_marker_exp_counts), scale = T)
+
+
+index = match(colnames(all_marker_exp_counts), org_bulk_meta$Sample_ID)
+all_sample_meta =  org_bulk_meta[index, ]
+
+
+groups <- as.factor(all_sample_meta$Line)
+fviz_pca_ind(fetal_org_marker_pca, title = 'Organoid PCA using Glut and GABA Fetal MetaMarkers',
+             col.ind = groups, # color by groups
+             legend.title = "Line",
+             label = 'none'
+             )
+
+groups <- as.factor(all_sample_meta$Region)
+fviz_pca_ind(fetal_org_marker_pca, title = 'Organoid PCA using Glut and GABA Fetal MetaMarkers',
+             col.ind = groups, # color by groups
+             legend.title = 'Region',
+             label = 'none'
+             )
+
+
+```
+
+
+
+
+
+

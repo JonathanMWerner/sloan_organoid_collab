@@ -1,0 +1,429 @@
+
+Trying a bulk deconvolution approach for the bulk organoid expression data.
+
+
+Doing something simple first, just from the set of fetal meta-markers, use the total counts as the background and then take the percentage of reads per marker set as the cell-type percentage of the sample. May need to normalize for expression levels.
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MetaMarkers)
+library(tibble)
+library(tidyr)
+
+```
+
+testing examples for Sridevi
+```{r}
+#Dataframe with the cell-type preserved coexpression auroc per organoid dataset
+organoid_dataset_presCoexp_scores_df = data.table::fread(file ='/home/werner/for_sharing/all_data_just_meta_seurat_with_addl_features_v2.csv' )
+organoid_dataset_presCoexp_scores_df
+
+#Dataframe with the mean preserved co-expression auroc per gene across all the individual organoid datasets. Also has the same for across fetal datasets
+x = load('/home/werner/for_sharing/all_gene_presCoexp_mats_v3.Rdata')
+org_gene_presCoexp_df = get(x[1])
+org_gene_presCoexp_df 
+
+
+#Code to score the significance of preserved coexpression for a gene set
+
+#Population mean and sd. 
+#The mean_org_preCoexp is the mean preserved co-expression AUROC for that gene across all organoid datasets, using the aggregate fetal network as the reference
+pop_mu = mean(org_gene_presCoexp_df$mean_org_preCoexp, na.rm = T)
+pop_sd = sd(org_gene_presCoexp_df$mean_org_preCoexp, na.rm = T)
+
+gene_set = c('list','of','genes')  #Gene set of interest
+num_genes = length(gene_set)
+
+
+sample_se = pop_sd / sqrt(num_genes) #sample error
+sample_mean = mean(org_gene_presCoexp_df %>% filter(gene %in% gene_set) %>% pull(mean_org_preCoexp))  #sample mean
+
+z_score = (sample_mean - pop_mu) / sample_se #Zscore for that gene set
+lower_pvalue = pnorm(z_score, lower.tail = T) #This pvalue is the probability a gene set has less than or equal to the preserved co-expression of the test gene set. Small values indicate the test gene set has significanyly less preserved fetal co-expression than expected from the global distribution
+
+twoSided_pvalue = 2*pnorm(abs(z_score), lower.tail = FALSE) #Use to determine whether significantly more or less preserved co-expression than expected.
+
+
+```
+
+
+Current co-expression scores
+
+```{r}
+
+org_ODS_scores_df = data.table::fread(file ='/home/werner/projects/organoid_variability/data/26_3_25_organoid_ODS_score_meta.csv' )
+org_ODS_scores_df
+all_scores_df = data.table::fread(file ='/home/werner/projects/organoid_variability/data/1_4_25_organoid_and_fetal_ODS_score_meta.csv' )
+all_scores_df 
+
+```
+
+Fetal MetaMarkers
+```{r}
+
+fetal_metaMarkers = read_meta_markers('/vault/werner/meta_qc_organoid/data/metamarkers/fetal_meta_markers_v2.csv.gz')
+
+top_markers = fetal_metaMarkers %>% filter(rank <= 100 & cell_type != 'other')
+
+dup_genes = top_markers$gene[which(duplicated(top_markers$gene))]
+#For each duplicate, assign it to the cell-type with the better (minimum) rank
+keep_dups = top_markers %>% filter(gene %in% dup_genes) %>% group_by(gene) %>% filter(rank == min(rank))
+top_markers = top_markers %>% filter(!gene %in% dup_genes)
+top_markers = rbind(top_markers, keep_dups)
+top_markers = top_markers %>% arrange(cell_type, rank)
+
+```
+
+
+Human gene GTF file
+
+```{r}
+human_gtf =rtracklayer::import('/vault/werner/cross_species_XCI/genomes/Homo_sapiens/gencode.v25.annotation.gtf')
+human_gtf = as.data.frame(human_gtf)
+human_gtf %>% filter(type == 'gene')
+```
+
+
+Load up the organoid bulk counts
+
+```{r}
+
+org_bulk_meta = data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/sample_IDs.csv')
+org_bulk_meta 
+
+length(unique(org_bulk_meta$Region))
+
+```
+
+
+```{r}
+org_bulk_counts = data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/count.matrix.v1.27.txt')
+org_bulk_counts = as.data.frame(org_bulk_counts)
+
+
+rownames(org_bulk_counts) = org_bulk_counts$V1
+org_bulk_counts = org_bulk_counts[ , 2:ncol(org_bulk_counts)]
+
+dim(org_bulk_counts)
+org_bulk_counts[1:10, 1:10]
+
+
+org_genes = rownames(org_bulk_counts)
+
+#Get the metadata associated with the organoid genes
+index = match(org_genes, human_gtf$gene_name)
+org_gene_meta = human_gtf[index, c('gene_name','gene_id','gene_type', 'width') ]
+
+org_gene_meta$width_kilo = org_gene_meta$width/1000
+
+```
+
+
+RPKM the organoid counts
+
+```{r}
+#First compute CPM
+scale_factors = colSums(org_bulk_counts)
+org_norm_counts = t(t(org_bulk_counts) / scale_factors) * 1e6
+
+
+#Then divide each row by the gene's kilobase, this gives RPKM
+org_norm_counts = org_norm_counts / org_gene_meta$width_kilo
+org_norm_counts = as.tibble(org_norm_counts, rownames = 'gene')
+org_norm_counts[1:10, 1:10]
+
+
+#Pivot longer
+org_norm_counts = org_norm_counts %>% pivot_longer(!gene, names_to = 'sample', values_to = 'RPKM')
+org_norm_counts
+
+```
+
+
+And now group by sample, then by marker set, and then get percentages of reads per marker set
+
+
+```{r}
+#Get the top 20 markers that are present within the organoid gene annotations
+divProg_markers = top_markers %>% filter(cell_type == 'Dividing_Progenitor' & rank <= 150) %>% pull(gene)
+divProg_markers = divProg_markers[divProg_markers %in% unique(org_norm_counts$gene)]
+divProg_markers = divProg_markers[1:25]
+
+nProg_markers = top_markers %>% filter(cell_type == 'Neural_Progenitor' & rank <= 150) %>% pull(gene)
+nProg_markers = nProg_markers[nProg_markers %in% unique(org_norm_counts$gene)]
+nProg_markers = nProg_markers[1:25]
+
+intProg_markers = top_markers %>% filter(cell_type == 'Intermediate_Progenitor' & rank <= 150) %>% pull(gene)
+intProg_markers = intProg_markers[intProg_markers %in% unique(org_norm_counts$gene)]
+intProg_markers = intProg_markers[1:25]
+
+glut_markers = top_markers %>% filter(cell_type == 'Glutamatergic' & rank <= 150) %>% pull(gene)
+glut_markers = glut_markers[glut_markers %in% unique(org_norm_counts$gene)]
+glut_markers = glut_markers[1:25]
+
+gaba_markers = top_markers %>% filter(cell_type == 'GABAergic' & rank <= 150) %>% pull(gene)
+gaba_markers = gaba_markers[gaba_markers %in% unique(org_norm_counts$gene)]
+gaba_markers = gaba_markers[1:25]
+
+nonN_markers = top_markers %>% filter(cell_type == 'Non-neuronal' & rank <= 150) %>% pull(gene)
+nonN_markers = nonN_markers[nonN_markers %in% unique(org_norm_counts$gene)]
+nonN_markers = nonN_markers[1:25]
+
+micro_markers = top_markers %>% filter(cell_type == 'Microglia/Immune' & rank <= 150) %>% pull(gene)
+micro_markers = micro_markers[micro_markers %in% unique(org_norm_counts$gene)]
+micro_markers = micro_markers[1:25]
+
+length(divProg_markers)
+length(nProg_markers)
+length(intProg_markers)
+length(glut_markers)
+length(gaba_markers)
+length(nonN_markers)
+length(micro_markers)
+
+org_norm_counts$meta_marker = rep('No', length = nrow(org_norm_counts))
+org_norm_counts$meta_marker[org_norm_counts$gene %in% divProg_markers] = 'Dividing_Progenitor'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% nProg_markers] = 'Neural_Progenitor'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% intProg_markers] = 'Intermediate_Progenitor'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% glut_markers] = 'Glutamatergic'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% gaba_markers] = 'GABAergic'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% nonN_markers] = 'Non-neuronal'
+org_norm_counts$meta_marker[org_norm_counts$gene %in% micro_markers] = 'Microglia/Immune'
+
+
+initial_celltype_percents_df = org_norm_counts %>% filter(meta_marker != 'No') %>% group_by(sample, meta_marker) %>% 
+  summarise(sum_rpkm = sum(RPKM, na.rm = T)) %>% group_by(sample) %>% 
+  mutate(total_marker_rpkm = sum(sum_rpkm)) %>%
+  mutate(marker_percent = sum_rpkm / total_marker_rpkm)
+
+
+initial_celltype_percents_df
+
+```
+
+
+Add the organoid sample metadata
+
+```{r}
+
+
+org_bulk_meta
+
+index = match(initial_celltype_percents_df$sample, org_bulk_meta$Sample_ID)
+
+initial_celltype_percents_df$Line = org_bulk_meta$Line[index]
+initial_celltype_percents_df$Age = org_bulk_meta$Age[index]
+initial_celltype_percents_df$Region = org_bulk_meta$Region[index]
+initial_celltype_percents_df$Condition = org_bulk_meta$Condition[index]
+initial_celltype_percents_df$Date.of.differentiation = org_bulk_meta$Date.of.differentiation[index]
+initial_celltype_percents_df$Version = org_bulk_meta$Version[index]
+```
+
+
+Explore results
+
+
+```{r}
+
+initial_celltype_percents_df %>% filter(meta_marker == 'Glutamatergic')
+
+initial_celltype_percents_df$meta_marker = factor(initial_celltype_percents_df$meta_marker, 
+                                                  levels = c('Dividing_Progenitor','Neural_Progenitor',
+                                                             'Intermediate_Progenitor','Glutamatergic','GABAergic',
+                                                             'Non-neuronal','Microglia/Immune'))
+
+
+ggplot(initial_celltype_percents_df, aes(x = Line, y = marker_percent)) + 
+  geom_boxplot() + facet_wrap(~meta_marker) 
+
+ggplot(initial_celltype_percents_df, aes(x = Region, y = marker_percent)) + 
+  geom_boxplot() + facet_wrap(~meta_marker) 
+
+ggplot(initial_celltype_percents_df, aes(x = Age, y = marker_percent)) + 
+  geom_boxplot() + facet_wrap(~meta_marker) 
+
+ggplot(initial_celltype_percents_df, aes(x = Condition, y = marker_percent)) + 
+  geom_boxplot() + facet_wrap(~meta_marker) 
+
+```
+
+
+```{r}
+
+org_ODS_scores_df
+
+
+index = match(initial_celltype_percents_df$sample, org_ODS_scores_df$Sample_ID)
+
+initial_celltype_percents_df$Dividing_Progenitor_ODS = org_ODS_scores_df$Dividing_Progenitor_ODS[index]
+initial_celltype_percents_df$Neural_Progenitor_ODS = org_ODS_scores_df$Neural_Progenitor_ODS[index]
+initial_celltype_percents_df$Intermediate_Progenitor_ODS = org_ODS_scores_df$Intermediate_Progenitor_ODS[index]
+initial_celltype_percents_df$Glutamatergic_ODS = org_ODS_scores_df$Glutamatergic_ODS[index]
+initial_celltype_percents_df$GABAergic_ODS = org_ODS_scores_df$GABAergic_ODS[index]
+initial_celltype_percents_df$Non_neuronal_ODS = org_ODS_scores_df$Non_neuronal_ODS[index]
+initial_celltype_percents_df$Microglia_ODS = org_ODS_scores_df$Microglia_ODS[index]
+
+```
+
+
+```{r}
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Dividing_Progenitor'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Dividing Progenitors')
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Neural_Progenitor'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Neural Progenitors')
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Intermediate_Progenitor'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Intermediate Progenitors')
+
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Glutamatergic'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Glutamatergic')
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'GABAergic'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('GABAergic')
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Non-neuronal'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Non-neuronal')
+
+ggplot(filter(initial_celltype_percents_df, meta_marker == 'Microglia/Immune'), 
+       aes(x = marker_percent, y = Dividing_Progenitor_ODS, color = Region )) + 
+  geom_point() + ylab('Co-expression ODS score') + xlab('Composition %') + ggtitle('Microglia')
+
+
+
+
+
+```
+
+
+And then the additional organoids grown in different media
+
+##############################################
+Extra data from Sloan and Co. 
+
+12 organoids total, 6 grown in matrigel, 6 grown in some other medium, supposedly have very different patterning
+
+
+```{r}
+
+
+org_ecm_counts = as.data.frame(data.table::fread('/inkwell03/werner/bulk_data/prelim_georgia_organoid/filtered_featurecounts_FL35_revised.csv'))
+
+rownames(org_ecm_counts) = org_ecm_counts$Geneid
+org_ecm_counts = org_ecm_counts[ , 2:ncol(org_ecm_counts)]
+
+#Get the gene metadata
+org_ecm_genes = rownames(org_ecm_counts)
+#Get the metadata associated with the organoid genes
+index = match(org_ecm_genes, human_gtf$gene_name)
+org_ecm_gene_meta = human_gtf[index, c('gene_name','gene_id','gene_type', 'width') ]
+
+org_ecm_gene_meta$width_kilo = org_ecm_gene_meta$width/1000
+
+#And RPKM normalize
+#First compute CPM
+scale_factors = colSums(org_ecm_counts)
+org_ecm_norm_counts = t(t(org_ecm_counts) / scale_factors) * 1e6
+
+
+#Then divide each row by the gene's kilobase, this gives RPKM
+org_ecm_norm_counts = org_ecm_norm_counts / org_ecm_gene_meta$width_kilo
+org_ecm_norm_counts = as.tibble(org_ecm_norm_counts, rownames = 'gene')
+org_ecm_norm_counts[1:10, 1:10]
+
+
+#Pivot longer
+org_ecm_norm_counts = org_ecm_norm_counts %>% pivot_longer(!gene, names_to = 'sample', values_to = 'RPKM')
+org_ecm_norm_counts
+
+
+org_ecm_norm_counts$meta_marker = rep('No', length = nrow(org_ecm_norm_counts))
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% divProg_markers] = 'Dividing_Progenitor'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% nProg_markers] = 'Neural_Progenitor'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% intProg_markers] = 'Intermediate_Progenitor'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% glut_markers] = 'Glutamatergic'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% gaba_markers] = 'GABAergic'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% nonN_markers] = 'Non-neuronal'
+org_ecm_norm_counts$meta_marker[org_ecm_norm_counts$gene %in% micro_markers] = 'Microglia/Immune'
+
+
+ecm_celltype_percents_df = org_ecm_norm_counts %>% filter(meta_marker != 'No') %>% group_by(sample, meta_marker) %>% 
+  summarise(sum_rpkm = sum(RPKM, na.rm = T)) %>% group_by(sample) %>% 
+  mutate(total_marker_rpkm = sum(sum_rpkm)) %>%
+  mutate(marker_percent = sum_rpkm / total_marker_rpkm)
+
+
+ecm_celltype_percents_df
+
+
+
+```
+
+Add the ODS scores
+
+```{r}
+org_ecm_ods_df = data.table::fread(file ='/home/werner/projects/organoid_variability/data/8_4_25_organoid_matrigel_vitronectin_ODS_score.csv' )
+
+org_ecm_ods_df
+
+
+index = match(ecm_celltype_percents_df$sample, org_ecm_ods_df$sample)
+
+ecm_celltype_percents_df$Dividing_Progenitor_ODS = org_ecm_ods_df$Dividing_Progenitor[index]
+ecm_celltype_percents_df$Neural_Progenitor_ODS = org_ecm_ods_df$Neural_Progenitor[index]
+ecm_celltype_percents_df$Intermediate_Progenitor_ODS = org_ecm_ods_df$Intermediate_Progenitor[index]
+ecm_celltype_percents_df$Glutamatergic_ODS = org_ecm_ods_df$Glutamatergic[index]
+ecm_celltype_percents_df$GABAergic_ODS = org_ecm_ods_df$GABAergic[index]
+ecm_celltype_percents_df$Non_neuronal_ODS = org_ecm_ods_df$`Non-neuronal`[index]
+
+```
+
+
+```{r}
+library(ggrepel)
+
+df_1 = filter(ecm_celltype_percents_df, meta_marker == 'Glutamatergic')
+df_2 = filter(ecm_celltype_percents_df, meta_marker == 'GABAergic')
+
+df_1$GABAergic_marker_percent = df_2$marker_percent
+
+ggplot(df_1, aes(x = marker_percent, y = GABAergic_marker_percent, label = sample  )) + geom_point(size = 5) +
+  geom_label_repel(max.overlaps = Inf, min.segment.length = 0) +
+  xlab('Glutamatergic composition') + ylab('GABAergic composition') + ggtitle('Organoids in different media')
+
+ggplot(df_1, aes(x = marker_percent, y = Glutamatergic_ODS, label = sample  )) + geom_point(size = 5) +
+  geom_label_repel(max.overlaps = Inf, min.segment.length = 0) +
+  xlab('Glutamatergic composition') + ylab('Glutamatergic co-exp ODS') + ggtitle('Organoids in different media')
+
+ggplot(df_1, aes(x = GABAergic_marker_percent, y = GABAergic_ODS, label = sample  )) + geom_point(size = 5) +
+  geom_label_repel(max.overlaps = Inf, min.segment.length = 0) +
+  xlab('GABAergic composition') + ylab('GABAergic co-exp ODS') + ggtitle('Organoids in different media')
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
